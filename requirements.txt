@@ -1,0 +1,38 @@
+# Core dependencies with specific versions (tested and working)
+# PyTorch (install separately based on CUDA version)
+# torch==2.1.0+cu121
+# torchvision==0.16.0+cu121
+# torchaudio==2.1.0+cu121
+
+# MMDetection core dependencies
+mmengine==0.10.7
+mmcv==2.1.0  # Install with: pip install mmcv==2.1.0 -f https://download.openmmlab.com/mmcv/dist/cu121/torch2.1.0/index.html
+
+# NumPy (must be < 2.0 for compatibility)
+numpy==1.26.4
+
+# Computer Vision
+opencv-python==4.11.0.86
+
+# Data processing
+shapely==2.1.2
+pycocotools==2.0.11
+scipy==1.15.3
+
+# Utilities
+tqdm==4.67.1
+matplotlib==3.10.8
+pyyaml==6.0.3
+six==1.17.0
+terminaltables==3.1.10
+
+# Build dependencies
+cython==3.2.3
+
+# Additional dependencies
+addict==2.4.0
+rich==14.2.0
+yapf==0.43.0
+
+# Logging and visualization
+wandb==0.16.0
