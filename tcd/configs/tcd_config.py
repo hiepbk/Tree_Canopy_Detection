@@ -223,16 +223,23 @@ checkpoint_config = dict(interval=5, save_last=True, max_keep_ckpts=3)
 
 # Logging configuration
 log_config = dict(
-    interval=50,
+    interval=10,
     hooks=[
-        dict(type='TextLoggerHook'),
-        dict(type='TensorboardLoggerHook'),
+        'TextLoggerHook',
+        'WandbHook',
     ],
+    wandb=dict(
+        init_kwargs=dict(
+            project='tree_canopy_detection',
+            name='tcd_exp1',
+        ),
+        num_eval_images=5,
+    ),
 )
 
 # Evaluation configuration
 evaluation = dict(
-    interval=5,
+    interval=1,
     metric=['segm'],
     save_best='segm_mAP',
     rule='greater',

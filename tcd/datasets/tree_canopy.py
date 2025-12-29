@@ -115,6 +115,20 @@ class TreeCanopyDataset(Dataset):
             'ori_shape': img.shape[:2],
         }
         
+        # Prepare img_metas with all available metadata
+        img_metas = {
+            'img_id': data_info['id'],
+            'filename': data_info['filename'],
+            'ori_shape': img.shape[:2],
+            'img_shape': img.shape[:2],
+        }
+        
+        # Add scene_type and cm_resolution if available
+        if 'scene_type' in data_info:
+            img_metas['scene_type'] = data_info['scene_type']
+        if 'cm_resolution' in data_info:
+            img_metas['cm_resolution'] = data_info['cm_resolution']
+        
         # Load annotations if not in test mode
         if not self.test_mode:
             ann_data = self._load_annotations_for_image(data_info)
@@ -123,11 +137,8 @@ class TreeCanopyDataset(Dataset):
             data['gt_bboxes'] = np.zeros((0, 4), dtype=np.float32)
             data['gt_labels'] = np.zeros((0,), dtype=np.int64)
             data['gt_masks'] = []
-            data['img_metas'] = {
-                'img_id': data_info['id'],
-                'filename': data_info['filename'],
-                'ori_shape': img.shape[:2],
-            }
+        
+        data['img_metas'] = img_metas
         
         # Apply pipeline (data augmentation)
         data = self._apply_pipeline(data)

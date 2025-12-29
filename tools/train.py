@@ -17,6 +17,9 @@ from tcd.models import MODEL
 from tcd.datasets import TreeCanopyDataset, collate_fn
 from tcd.utils import Config
 from tcd.configs import tcd_config
+from tcd.evaluation import WeightedMAPEvaluator
+from tcd.utils.runner import Runner
+from tcd.utils.hooks import TextLoggerHook, WandbHook
 
 
 def parse_args():
@@ -146,13 +149,19 @@ def build_optimizer(model, cfg):
     return optimizer
 
 
-def train_epoch(model, dataloader, optimizer, epoch, cfg, distributed=False):
+def train_epoch(runner, dataloader, cfg, distributed=False):
     """Train one epoch."""
-    model.train()
+    runner.model.train()
     total_loss = 0.0
     num_batches = 0
     
+    # Call before_train_epoch hook
+    runner.call_hook('before_train_epoch')
+    
     for batch_idx, data in enumerate(dataloader):
+        # Call before_train_iter hook
+        runner.call_hook('before_train_iter', batch_idx=batch_idx, data=data)
+        
         # Data is already in correct format from collate_fn:
         # img: [B, C, H, W] tensor
         # gt_bboxes: List[Tensor] - one per image
@@ -168,7 +177,7 @@ def train_epoch(model, dataloader, optimizer, epoch, cfg, distributed=False):
         img_metas = data['img_metas']
         
         # Forward
-        losses = model(
+        losses = runner.model(
             img=img,
             img_metas=img_metas,
             gt_bboxes=gt_bboxes,
@@ -179,32 +188,37 @@ def train_epoch(model, dataloader, optimizer, epoch, cfg, distributed=False):
         # Compute total loss
         if isinstance(losses, dict):
             loss = sum(losses.values())
-            # Print individual losses
-            if batch_idx % 10 == 0:
-                loss_str = ', '.join([f'{k}: {v.item():.4f}' for k, v in losses.items()])
-                print(f'Epoch {epoch}, Batch {batch_idx}, Total Loss: {loss.item():.4f} ({loss_str})')
         else:
             loss = losses
-            if batch_idx % 10 == 0:
-                print(f'Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}')
         
         # Backward
-        optimizer.zero_grad()
+        runner.optimizer.zero_grad()
         loss.backward()
         
         # Gradient clipping
         if 'optimizer_config' in cfg and 'grad_clip' in cfg['optimizer_config']:
             torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
+                runner.model.parameters(),
                 **cfg['optimizer_config']['grad_clip'],
             )
         
-        optimizer.step()
+        runner.optimizer.step()
         
         total_loss += loss.item()
         num_batches += 1
+        
+        # Update iteration counter
+        runner.iter += 1
+        
+        # Call after_train_iter hook
+        runner.call_hook('after_train_iter', batch_idx=batch_idx, data=data, outputs=losses)
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    runner.train_losses.append(avg_loss)
+    
+    # Call after_train_epoch hook
+    runner.call_hook('after_train_epoch')
+    
     return avg_loss
 
 
@@ -230,9 +244,13 @@ def main():
     else:
         rank = 0
     
-    # Create work directory
-    work_dir = args.work_dir
+    # Create work directory with timestamp
+    from datetime import datetime
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    base_work_dir = args.work_dir
+    work_dir = os.path.join(base_work_dir, f'exp_{timestamp}')
     os.makedirs(work_dir, exist_ok=True)
+    print(f'Experiment directory: {work_dir}')
     
     # Build model
     model = build_model(cfg)
@@ -252,24 +270,101 @@ def main():
     # Build optimizer
     optimizer = build_optimizer(model.module if distributed else model, cfg)
     
+    # Create runner
+    runner = Runner(
+        model=model.module if distributed else model,
+        optimizer=optimizer,
+        work_dir=work_dir,
+        max_epochs=cfg['runner']['max_epochs'],
+        rank=rank,
+    )
+    
+    # Register hooks
+    log_config = cfg.get('log_config', {})
+    log_interval = log_config.get('interval', 10)
+    hooks_list = log_config.get('hooks', [])
+    
+    # Text logger hook (always register)
+    text_logger = TextLoggerHook(interval=log_interval)
+    runner.register_hook(text_logger)
+    
+    # Wandb hook
+    if 'WandbHook' in hooks_list or 'wandb' in hooks_list:
+        wandb_config = log_config.get('wandb', {})
+        wandb_hook = WandbHook(
+            init_kwargs=wandb_config.get('init_kwargs', {}),
+            interval=log_interval,
+            num_eval_images=wandb_config.get('num_eval_images', 5),
+            work_dir=work_dir,
+        )
+        runner.register_hook(wandb_hook)
+    
     # Training loop
     max_epochs = cfg['runner']['max_epochs']
     for epoch in range(max_epochs):
+        runner.epoch = epoch
+        
         if distributed:
             train_loader.sampler.set_epoch(epoch)
         
         # Train
-        train_loss = train_epoch(
-            model.module if distributed else model,
-            train_loader,
-            optimizer,
-            epoch,
-            cfg,
-            distributed=distributed,
-        )
+        train_loss = train_epoch(runner, train_loader, cfg, distributed=distributed)
         
         if rank == 0:
-            print(f'Epoch {epoch} completed. Average loss: {train_loss:.4f}')
+            # Evaluation
+            eval_interval = cfg.get('evaluation', {}).get('interval', 5)
+            if (epoch + 1) % eval_interval == 0:
+                # Call before_val_epoch hook
+                runner.call_hook('before_val_epoch')
+                
+                evaluator = WeightedMAPEvaluator(iou_threshold=0.75)
+                model_eval = model.module if distributed else model
+                model_eval.eval()
+                
+                val_images_all = []
+                # Get image prefix from config
+                img_prefix = cfg.get('data', {}).get('val', {}).get('img_prefix', '')
+                
+                with torch.no_grad():
+                    for batch_idx, data in enumerate(val_loader):
+                        # Move data to device
+                        img = data['img'].cuda()
+                        gt_bboxes = [bbox.cuda() for bbox in data['gt_bboxes']]
+                        gt_labels = [label.cuda() for label in data['gt_labels']]
+                        gt_masks = [mask.cuda() for mask in data['gt_masks']]
+                        img_metas = data['img_metas']
+                        
+                        # Forward pass
+                        outputs = model_eval(
+                            img=img,
+                            img_metas=img_metas,
+                            return_loss=False,
+                        )
+                        
+                        # Evaluate batch (with visualization - loads original images from disk)
+                        val_images = evaluator.evaluate_batch(
+                            outputs['pred_logits'],
+                            outputs['pred_masks'],
+                            gt_labels,
+                            gt_masks,
+                            img_metas,
+                            img_prefix=img_prefix,
+                            return_images=True,
+                        )
+                        
+                        if val_images:
+                            val_images_all.extend(val_images)
+                
+                # Compute weighted mAP
+                eval_results = evaluator.compute_weighted_map()
+                
+                # Add visualization data to results
+                eval_results['val_images'] = val_images_all
+                
+                # Call after_val_epoch hook
+                runner.call_hook('after_val_epoch', metrics=eval_results)
+                
+                model_eval.train()
             
             # Save checkpoint
             if (epoch + 1) % cfg['checkpoint_config']['interval'] == 0:
