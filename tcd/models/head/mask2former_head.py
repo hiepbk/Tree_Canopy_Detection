@@ -458,6 +458,16 @@ class Mask2FormerHead(nn.Module):
         pred_h, pred_w = pred_masks.shape[-2:]
         
         for labels, masks in zip(gt_labels, gt_masks):
+            # Handle empty masks (no instances)
+            if masks.shape[0] == 0:
+                # Empty masks - create empty tensor with correct spatial dims
+                empty_masks = torch.zeros((0, pred_h, pred_w), dtype=torch.float32, device=masks.device)
+                targets.append({
+                    'labels': labels,  # [0]
+                    'masks': empty_masks,  # [0, H_pred, W_pred]
+                })
+                continue
+            
             # masks shape: [num_instances, H_img, W_img]
             # Resize to match pred_masks: [num_instances, H_pred, W_pred]
             if masks.shape[-2:] != (pred_h, pred_w):
@@ -502,7 +512,7 @@ class Mask2FormerHead(nn.Module):
             loss_cls_all.append(loss_cls)
             
             # Mask losses
-            if len(target_idx) > 0:
+            if len(target_idx) > 0 and targets[b]['masks'].shape[0] > 0:
                 pred_masks_b = pred_masks[b][pred_idx]  # [num_matched, H, W]
                 target_masks_b = targets[b]['masks'][target_idx]  # [num_matched, H, W]
                 
@@ -512,14 +522,34 @@ class Mask2FormerHead(nn.Module):
                 pred_masks_b = pred_masks_b.unsqueeze(1)  # [num_matched, 1, H, W]
                 target_masks_b = target_masks_b.unsqueeze(1)  # [num_matched, 1, H, W]
                 
+                # loss_mask uses DiceLoss with activate=True (applies sigmoid)
+                # loss_dice uses DiceLoss with activate=False (we need to apply sigmoid manually)
                 loss_mask = self.loss_mask(pred_masks_b, target_masks_b)
-                loss_dice = self.loss_dice(pred_masks_b, target_masks_b)
+                # For dice loss, apply sigmoid since activate=False
+                pred_masks_b_sigmoid = torch.sigmoid(pred_masks_b)
+                loss_dice = self.loss_dice(pred_masks_b_sigmoid, target_masks_b)
                 
                 loss_mask_all.append(loss_mask)
                 loss_dice_all.append(loss_dice)
             else:
-                loss_mask_all.append(torch.tensor(0.0, device=pred_masks.device))
-                loss_dice_all.append(torch.tensor(0.0, device=pred_masks.device))
+                # No matched instances - still compute loss on unmatched predictions
+                # Penalize all predictions to predict "no object" (empty mask)
+                if targets[b]['masks'].shape[0] == 0:
+                    # No ground truth - all predictions should be empty
+                    # Use a small loss to encourage predictions to be empty
+                    num_queries = pred_masks[b].shape[0]
+                    empty_pred = pred_masks[b].unsqueeze(1)  # [num_queries, 1, H, W]
+                    empty_target = torch.zeros((num_queries, 1, pred_h, pred_w), 
+                                             dtype=torch.float32, device=pred_masks.device)
+                    loss_mask = self.loss_mask(empty_pred, empty_target) * 0.1  # Small weight
+                    loss_dice = self.loss_dice(empty_pred, empty_target) * 0.1
+                else:
+                    # Has targets but no matches - this shouldn't happen often
+                    loss_mask = torch.tensor(0.0, device=pred_masks.device)
+                    loss_dice = torch.tensor(0.0, device=pred_masks.device)
+                
+                loss_mask_all.append(loss_mask)
+                loss_dice_all.append(loss_dice)
         
         return {
             'loss_cls': torch.stack(loss_cls_all).mean(),

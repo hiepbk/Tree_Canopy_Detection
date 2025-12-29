@@ -182,7 +182,7 @@ test_dataset = dict(
 
 # Data loader configuration
 data = dict(
-    samples_per_gpu=1,  # Batch size per GPU
+    samples_per_gpu=2,  # Batch size per GPU
     workers_per_gpu=4,  # Number of data loading workers per GPU
     train=train_dataset,
     val=val_dataset,
