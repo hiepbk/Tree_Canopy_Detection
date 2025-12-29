@@ -7,8 +7,10 @@ Supports loading pretrained weights for RGB aerial imagery
 import torch
 import torch.nn as nn
 import torchvision
+from tcd.models import BACKBONE
 
 
+@BACKBONE.register_module()
 class SwinBackbone(nn.Module):
     """
     Swin Transformer backbone for SatlasPretrain models.
@@ -78,6 +80,7 @@ class SwinBackbone(nn.Module):
         return [outputs[-7], outputs[-5], outputs[-3], outputs[-1]]
 
 
+@BACKBONE.register_module()
 class AggregationBackbone(nn.Module):
     """
     Multi-image aggregation backbone wrapper.

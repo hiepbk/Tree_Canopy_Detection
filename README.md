@@ -394,44 +394,154 @@ During the competition, the **Public score**, calculated with about 35% of the e
    bash tools/dist_train.sh configs/mask2former/mask2former_swin-b-p4-w12-384-in21k_8xb2-lsj-50e_tree_canopy.py 4
    ```
 
-### ⚠️ Small Dataset Considerations (~150 samples)
+### ⚠️ Small Dataset Strategy: Handling 108 Samples with ~298 Instances per Image
 
-If you have a small dataset (e.g., ~150 samples), using Mask2Former with Swin-B may lead to overfitting. **Recommended approach:**
+**Current Dataset Statistics:**
+- **Training images:** 108 samples
+- **Total annotations:** 32,152 instances
+- **Average instances per image:** ~298 instances
+- **High diversity:** Multiple scene types, resolutions (10cm-80cm), and geographic locations
+- **Multi-scale:** Instances vary from individual trees to large groups
 
-1. **Use the smaller Swin-T config** (optimized for small datasets):
-   ```bash
-   # Single GPU
-   python tools/train.py configs/mask2former/mask2former_swin-t-p4-w7-224_8xb2-lsj-50e_tree_canopy.py
-   
-   # 4 GPUs
-   bash tools/dist_train.sh configs/mask2former/mask2former_swin-t-p4-w7-224_8xb2-lsj-50e_tree_canopy.py 4
-   ```
+**Key Challenges:**
+1. **Small Dataset (108 samples)** → High risk of overfitting
+2. **Many Instances per Image (~298)** → Model needs to handle dense predictions
+3. **High Diversity** → Model must generalize across scene types, resolutions, and locations
+4. **Multi-Scale Instances** → Individual trees vs. large groups in same image
 
-2. **Key differences in Swin-T config:**
-   - **Smaller backbone:** Swin-T (96 dims) vs Swin-B (128 dims)
-   - **Reduced queries:** 50 vs 100
-   - **Fewer decoder layers:** 6 vs 9
-   - **Frozen backbone stages:** First 2 stages frozen
-   - **Lower learning rate:** 0.00005 vs 0.0001
-   - **Stronger augmentation:** Color jitter, wider scale range
-   - **More dropout:** Added throughout for regularization
+#### 1. Model Architecture Adjustments
 
-3. **Alternative: ResNet-50 backbone** (even smaller):
-   - Use `mask2former_r50_8xb2-lsj-50e_coco.py` as base
-   - Modify for tree canopy dataset (similar to Swin-T config)
+**Use Smaller Backbone:**
+- **Swin-T** (96 dims) instead of Swin-B (128 dims) - recommended
+- **ResNet-50** as alternative (even smaller)
 
-4. **Additional strategies for small datasets:**
-   - **Early stopping:** Monitor validation mAP and stop if it plateaus
-   - **Strong data augmentation:** Use all available augmentations
-   - **Transfer learning:** Freeze more backbone layers
-   - **Cross-validation:** Consider K-fold if dataset is very small
-   - **Pseudo-labeling:** If you have unlabeled test data, use it for training
-   
-   **Note:** For WandB logging, make sure to install wandb and set your API key:
-   ```bash
-   pip install wandb==0.16.0
-   export WANDB_API_KEY="your-api-key-here"  # Optional, will prompt if not set
-   ```
+**Model Capacity Adjustments:**
+- **Increase queries:** 100 (to handle ~298 instances per image)
+- **Fewer decoder layers:** 6 instead of 9 (prevent overfitting)
+- **Smaller pixel decoder:** 4 layers instead of 6
+- **Freeze more layers:** First 3 stages of backbone (instead of 2)
+- **Lower learning rate:** 0.00001 initially, with backbone_lr_mult=0.01
+
+**Training Command:**
+```bash
+# Single GPU
+python tools/train.py configs/mask2former/mask2former_swin-t-p4-w7-224_8xb2-lsj-50e_tree_canopy.py
+
+# 4 GPUs
+bash tools/dist_train.sh configs/mask2former/mask2former_swin-t-p4-w7-224_8xb2-lsj-50e_tree_canopy.py 4
+```
+
+#### 2. Aggressive Data Augmentation (Critical)
+
+**Goal:** Increase effective dataset size from 108 to 1000+ variations
+
+**Spatial Augmentations:**
+- **Multi-scale training:** Random resize to [512, 768, 1024, 1280] with ratio_range=(0.5, 2.0)
+- **Random cropping:** Large crop size (1024×1024)
+- **Random flipping:** Both horizontal and vertical (prob=0.5)
+- **Random rotation:** Small angles (-15° to +15°) to preserve tree shapes
+- **Elastic deformation:** Simulates different viewing angles (prob=0.3)
+
+**Photometric Augmentations (Simulate Sensor Differences):**
+- **Color jitter:** brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1
+- **Random blur:** Gaussian blur (prob=0.3, sigma_range=(0.5, 2.0))
+- **Random noise:** Gaussian noise (prob=0.2, std_range=(0.01, 0.05))
+- **Gamma correction:** Simulates different exposure (prob=0.3, gamma_range=(0.7, 1.3))
+- **JPEG compression:** Simulates compression artifacts (prob=0.2, quality_range=(60, 100))
+
+**Advanced Augmentations:**
+- **MixUp:** Combines two images (prob=0.3, alpha=0.2)
+- **Mosaic:** Combines 4 images (prob=0.5)
+- **Copy-Paste:** Pastes instances from other images (prob=0.3, max_num_pasted=10)
+
+#### 3. Training Strategy
+
+**Learning Rate Schedule:**
+- **Initial LR:** 0.00001 (very conservative)
+- **Cosine annealing with warmup:** warmup_iters=500, warmup_ratio=0.001, min_lr=0.000001
+- **Progressive unfreezing:**
+  - Stage 1 (epochs 0-10): Freeze all backbone layers
+  - Stage 2 (epochs 10-20): Unfreeze last stage
+  - Stage 3 (epochs 20-30): Unfreeze last 2 stages
+  - Stage 4 (epochs 30+): Fine-tune all layers
+
+**Regularization:**
+- **Weight decay:** 0.05 (strong regularization)
+- **Dropout:** drop_rate=0.2, attn_drop_rate=0.2, ffn_drop=0.2
+- **Label smoothing:** 0.1 (for classification head)
+- **Early stopping:** Monitor validation mAP, patience=10 epochs
+
+#### 4. Loss Function Adjustments (For Many Instances)
+
+**Combined Loss Functions:**
+- **Focal Loss:** Handles class imbalance (gamma=2.0, alpha=0.25, weight=2.0)
+- **Dice Loss:** Handles instance overlap (weight=1.0)
+- **Boundary Loss:** Improves edge separation (weight=0.5)
+
+**Instance Matching Strategy:**
+- **Hungarian matcher:** cost_class=2.0, cost_mask=5.0, cost_dice=5.0
+- **More sampling points:** num_points=12544 (for dense instances)
+
+#### 5. Multi-Scale Training & Testing
+
+**Training:**
+- Train with multiple resolutions: [512, 768, 1024, 1280]
+- Wide aspect ratio range: (0.5, 2.0)
+
+**Test-Time Augmentation (TTA):**
+- Multi-scale testing: scales=[0.8, 1.0, 1.2]
+- Slide window inference: crop_size=(1024, 1024), stride=(512, 512)
+
+#### 6. Handling High Diversity
+
+**Scene-Type Conditioning (Optional):**
+- Add scene_type as auxiliary embedding to help model adapt to different environments
+- Inject into decoder: `decoder_input = backbone_features + scene_embedding`
+
+**Resolution-Aware Training:**
+- Higher weight for high-resolution samples (matches evaluation weights):
+  - 10cm: 1.0, 20cm: 1.25, 40cm: 2.0, 60cm: 2.5, 80cm: 3.0
+
+**Stratified Sampling:**
+- Already implemented: Maintains distribution of scene_type and cm_resolution in train/val splits
+- Ensures model sees all types during training
+
+#### 7. Transfer Learning Strategy
+
+**Use SatlasPretrain Backbone:**
+- **Aerial_SwinB_SI** checkpoint (already downloaded in `pretrained/`)
+- Pretrained on aerial/satellite imagery → better initialization
+- Freeze early stages, fine-tune later stages progressively
+
+#### 8. Validation & Post-Processing
+
+**Validation Strategy:**
+- Keep 20% as validation (already done)
+- Monitor validation metrics closely
+- Consider K-fold cross-validation (5-fold) for very small datasets
+
+**Post-Processing for Dense Instances:**
+- **Non-Maximum Suppression (NMS):** Remove overlapping predictions (iou_threshold=0.5)
+- **Instance merging:** Merge close instances if needed (distance_threshold=50 pixels)
+
+#### 9. Expected Results
+
+With these strategies:
+- **Effective dataset size:** 108 → 1000+ (via augmentation)
+- **Overfitting risk:** Reduced via regularization
+- **Generalization:** Improved via multi-scale training
+- **Instance handling:** Better via adjusted loss functions
+- **Diversity handling:** Improved via scene-type awareness
+
+**Target Metrics:**
+- Validation mAP: >0.5 (with IoU threshold 0.75)
+- Training/validation gap: <0.1 (indicates good generalization)
+
+**Note:** For WandB logging, make sure to install wandb and set your API key:
+```bash
+pip install wandb==0.16.0
+export WANDB_API_KEY="your-api-key-here"  # Optional, will prompt if not set
+```
 4. **Explore the data** structure and annotations
 5. **Develop your segmentation model**
 6. **Validate your submission** using `solafune_tools.competition_tools`
