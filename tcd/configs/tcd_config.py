@@ -250,7 +250,7 @@ log_config = dict(
 
 # Evaluation configuration
 evaluation = dict(
-    interval=1,
+    interval=5,
     metric=['segm'],
     save_best='segm_mAP',
     rule='greater',
