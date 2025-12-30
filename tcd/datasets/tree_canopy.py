@@ -50,8 +50,12 @@ class TreeCanopyDataset(Dataset):
     
     def _load_annotations(self) -> List[Dict[str, Any]]:
         """Load annotations from COCO format file."""
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f'Loading annotations from {self.ann_file}...')
         with open(self.ann_file, 'r') as f:
             coco_data = json.load(f)
+        logger.info(f'Annotations loaded: {len(coco_data.get("images", []))} images, {len(coco_data.get("annotations", []))} annotations')
         
         # Build image info list
         images = coco_data.get('images', [])
@@ -130,6 +134,7 @@ class TreeCanopyDataset(Dataset):
             img_metas['cm_resolution'] = data_info['cm_resolution']
         
         # Load annotations if not in test mode
+        # Note: LoadAnnotations transform will generate both polygons and original masks
         if not self.test_mode:
             ann_data = self._load_annotations_for_image(data_info)
             data.update(ann_data)

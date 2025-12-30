@@ -159,12 +159,15 @@ class HungarianMatcher(nn.Module):
             num_targets = points.shape[0]
             num_points = points.shape[1]
             
-            # Expand out_mask_flat: [num_queries, 1, H*W] -> [num_queries, num_targets, H*W]
-            out_mask_expanded = out_mask_flat.unsqueeze(1).expand(-1, num_targets, -1)  # [num_queries, num_targets, H*W]
+            # Memory-efficient sampling using expand (doesn't copy, just creates view)
             # Expand points: [1, num_targets, num_points] -> [num_queries, num_targets, num_points]
             points_expanded = points.unsqueeze(0).expand(num_queries, -1, -1)  # [num_queries, num_targets, num_points]
             
-            # Gather sampled points: [num_queries, num_targets, num_points]
+            # Gather sampled points: need to expand out_mask_flat to match dimensions
+            # out_mask_flat: [num_queries, H*W]
+            # Expand to: [num_queries, num_targets, H*W] (view, no copy)
+            out_mask_expanded = out_mask_flat.unsqueeze(1).expand(-1, num_targets, -1)  # [num_queries, num_targets, H*W]
+            # Now gather: [num_queries, num_targets, num_points]
             out_mask_sampled = out_mask_expanded.gather(2, points_expanded)  # [num_queries, num_targets, num_points]
             
             # Sample from tgt_mask: [num_targets, num_points]
@@ -274,6 +277,7 @@ class Mask2FormerHead(nn.Module):
         loss_cls: Optional[Dict] = None,
         loss_mask: Optional[Dict] = None,
         loss_dice: Optional[Dict] = None,
+        num_points: int = 12544,  # Default, will be overridden by train_cfg
     ):
         super(Mask2FormerHead, self).__init__()
         
@@ -283,6 +287,7 @@ class Mask2FormerHead(nn.Module):
         self.num_queries = num_queries
         self.num_transformer_feat_level = num_transformer_feat_level
         self.align_corners = align_corners
+        self.num_points = num_points  # Store num_points for matcher
         
         # Pixel decoder (simplified - in practice use MSDeformAttn)
         self.pixel_decoder = self._build_pixel_decoder(
@@ -485,7 +490,7 @@ class Mask2FormerHead(nn.Module):
             })
         
         # Hungarian matching
-        matcher = HungarianMatcher()
+        matcher = HungarianMatcher(num_points=self.num_points)
         indices = matcher(
             {'pred_logits': pred_logits, 'pred_masks': pred_masks},
             targets,

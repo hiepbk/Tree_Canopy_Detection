@@ -59,6 +59,9 @@ class Mask2Former(nn.Module):
         
         # Build head using registry
         head_cfg = head.copy()
+        # Pass num_points from train_cfg to head
+        if train_cfg and 'num_points' in train_cfg:
+            head_cfg['num_points'] = train_cfg['num_points']
         self.head = build_from_cfg(head_cfg, HEAD)
         
         self.train_cfg = train_cfg

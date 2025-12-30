@@ -28,15 +28,49 @@ class LoadImageFromFile:
 
 @TRANSFORM.register_module()
 class LoadAnnotations:
-    """Load annotations (bboxes, labels, masks)."""
+    """Load annotations (bboxes, labels, masks).
+    
+    Generates original masks from polygons and stores as ori_gt_masks.
+    Keeps gt_masks as polygons for transforms.
+    """
     
     def __init__(self, with_bbox: bool = True, with_mask: bool = True):
         self.with_bbox = with_bbox
         self.with_mask = with_mask
     
     def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Load annotations."""
-        # Annotations should already be loaded in dataset
+        """Load annotations and generate original masks from polygons."""
+        if self.with_mask and 'gt_masks' in data and len(data['gt_masks']) > 0:
+            # Get original image size
+            ori_h, ori_w = data.get('ori_shape', data.get('img_shape', (1024, 1024)))
+            
+            # Generate masks from polygons at original size
+            ori_gt_masks = []
+            for mask in data['gt_masks']:
+                if isinstance(mask, list) and len(mask) > 0:
+                    # Polygon format - convert to mask at original size
+                    mask_array = np.zeros((ori_h, ori_w), dtype=np.float32)
+                    if isinstance(mask[0], list):
+                        # Multiple polygons per mask
+                        for poly in mask:
+                            coords = np.array(poly).reshape(-1, 2).astype(np.int32)
+                            cv2.fillPoly(mask_array, [coords], 1.0)
+                    else:
+                        # Single polygon: [x1, y1, x2, y2, ...]
+                        coords = np.array(mask).reshape(-1, 2).astype(np.int32)
+                        cv2.fillPoly(mask_array, [coords], 1.0)
+                    ori_gt_masks.append(mask_array)
+                else:
+                    # Empty polygon
+                    ori_gt_masks.append(np.zeros((ori_h, ori_w), dtype=np.float32))
+            
+            # Store original masks (at original size)
+            data['ori_gt_masks'] = ori_gt_masks
+        else:
+            # No masks or empty
+            data['ori_gt_masks'] = []
+        
+        # Keep gt_masks as polygons (for transforms)
         return data
 
 
@@ -84,18 +118,48 @@ class Resize:
         data['img_shape'] = (new_h, new_w)
         data['scale_factor'] = (new_h / h, new_w / w)
         
-        # Resize masks if present
+        # Resize masks (polygons) if present - scale coordinates to match resized image
+        # Calculate scale factors for polygon coordinate scaling
+        scale_w = new_w / w if w > 0 else 1.0
+        scale_h = new_h / h if h > 0 else 1.0
+        
         if 'gt_masks' in data:
+            # Scale polygons (keep as polygons, don't generate masks yet)
             resized_masks = []
             for mask in data['gt_masks']:
                 if isinstance(mask, list):
-                    # Polygon - will be resized later if needed
-                    resized_masks.append(mask)
+                    # Polygon format - scale coordinates to match resized image
+                    if len(mask) > 0:
+                        if isinstance(mask[0], list):
+                            # Multiple polygons per mask
+                            scaled_polys = []
+                            for poly in mask:
+                                # Scale polygon coordinates: [x1, y1, x2, y2, ...]
+                                scaled_poly = []
+                                for i in range(0, len(poly), 2):
+                                    if i + 1 < len(poly):
+                                        scaled_poly.append(poly[i] * scale_w)      # x coordinate
+                                        scaled_poly.append(poly[i + 1] * scale_h)  # y coordinate
+                                scaled_polys.append(scaled_poly)
+                            resized_masks.append(scaled_polys)
+                        else:
+                            # Single polygon: [x1, y1, x2, y2, ...]
+                            scaled_poly = []
+                            for i in range(0, len(mask), 2):
+                                if i + 1 < len(mask):
+                                    scaled_poly.append(mask[i] * scale_w)      # x coordinate
+                                    scaled_poly.append(mask[i + 1] * scale_h)  # y coordinate
+                            resized_masks.append(scaled_poly)
+                    else:
+                        # Empty polygon
+                        resized_masks.append([])
                 else:
-                    # Array mask
-                    mask_resized = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-                    resized_masks.append(mask_resized)
+                    raise TypeError(f"Expected polygon (list), but got {type(mask)}. "
+                                  f"gt_masks should be polygons before Polygon2Mask transform.")
             data['gt_masks'] = resized_masks
+        
+        # Keep original polygons unchanged (for evaluation/visualization)
+        # ori_gt_masks is preserved as-is through all transforms
         
         return data
 
@@ -111,6 +175,7 @@ class RandomFlip:
     
     def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Flip image and annotations."""
+        # ori_gt_masks (original masks) are preserved as-is through all transforms
         if random.random() < self.prob:
             img = data['img']
             h, w = img.shape[:2]
@@ -125,21 +190,39 @@ class RandomFlip:
                     bboxes[:, [0, 2]] = w - bboxes[:, [2, 0]]
                     data['gt_bboxes'] = bboxes
                 
-                # Flip masks (polygons)
+                # Flip masks (polygons) - keep as polygons, don't generate masks yet
                 if 'gt_masks' in data:
                     flipped_masks = []
                     for mask in data['gt_masks']:
                         if isinstance(mask, list):
                             # Polygon: flip x coordinates
-                            flipped_poly = []
-                            for poly in mask if isinstance(mask[0], list) else [mask]:
-                                flipped_coords = [[w - x, y] for x, y in zip(poly[::2], poly[1::2])]
-                                flipped_poly.append([coord for pair in flipped_coords for coord in pair])
-                            flipped_masks.append(flipped_poly[0] if len(flipped_poly) == 1 else flipped_poly)
+                            if len(mask) > 0:
+                                if isinstance(mask[0], list):
+                                    # Multiple polygons per mask
+                                    flipped_polys = []
+                                    for poly in mask:
+                                        # Flip x coordinates: [x1, y1, x2, y2, ...] -> [w-x1, y1, w-x2, y2, ...]
+                                        flipped_poly = []
+                                        for i in range(0, len(poly), 2):
+                                            if i + 1 < len(poly):
+                                                flipped_poly.append(w - poly[i])  # flipped x
+                                                flipped_poly.append(poly[i + 1])  # y unchanged
+                                        flipped_polys.append(flipped_poly)
+                                    flipped_masks.append(flipped_polys)
+                                else:
+                                    # Single polygon: [x1, y1, x2, y2, ...]
+                                    flipped_poly = []
+                                    for i in range(0, len(mask), 2):
+                                        if i + 1 < len(mask):
+                                            flipped_poly.append(w - mask[i])  # flipped x
+                                            flipped_poly.append(mask[i + 1])  # y unchanged
+                                    flipped_masks.append(flipped_poly)
+                            else:
+                                # Empty polygon
+                                flipped_masks.append([])
                         else:
-                            # Array mask
-                            flipped_mask = cv2.flip(mask, 1)
-                            flipped_masks.append(flipped_mask)
+                            raise TypeError(f"Expected polygon (list), but got {type(mask)}. "
+                                          f"gt_masks should be polygons before Polygon2Mask transform.")
                     data['gt_masks'] = flipped_masks
             
             elif self.direction == 'vertical':
@@ -252,6 +335,48 @@ class Pad:
 
 
 @TRANSFORM.register_module()
+class Polygon2Mask:
+    """Convert polygons to masks.
+    
+    This transform should be placed right before DefaultFormatBundle.
+    It converts gt_masks from polygon format to mask format (numpy arrays).
+    """
+    
+    def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert polygons to masks."""
+        if 'gt_masks' in data and len(data['gt_masks']) > 0:
+            # Get current image size
+            img = data['img']
+            h, w = img.shape[:2]
+            
+            # Convert polygons to masks
+            mask_arrays = []
+            for mask in data['gt_masks']:
+                if isinstance(mask, list):
+                    # Polygon format - convert to mask
+                    mask_array = np.zeros((h, w), dtype=np.float32)
+                    if len(mask) > 0:
+                        if isinstance(mask[0], list):
+                            # Multiple polygons per mask
+                            for poly in mask:
+                                coords = np.array(poly).reshape(-1, 2).astype(np.int32)
+                                cv2.fillPoly(mask_array, [coords], 1.0)
+                        else:
+                            # Single polygon: [x1, y1, x2, y2, ...]
+                            coords = np.array(mask).reshape(-1, 2).astype(np.int32)
+                            cv2.fillPoly(mask_array, [coords], 1.0)
+                    mask_arrays.append(mask_array)
+                else:
+                    raise TypeError(f"Expected polygon (list), but got {type(mask)}. "
+                                  f"gt_masks should be polygons before Polygon2Mask transform.")
+            data['gt_masks'] = mask_arrays
+        else:
+            data['gt_masks'] = []
+        
+        return data
+
+
+@TRANSFORM.register_module()
 class DefaultFormatBundle:
     """Format data to default format (tensors)."""
     
@@ -278,8 +403,18 @@ class DefaultFormatBundle:
         else:
             data['gt_labels'] = torch.zeros((0,), dtype=torch.long)
         
-        # Keep masks as list for now (will be processed in collate)
-        if 'gt_masks' not in data:
+        # Convert masks to tensors (masks are already numpy arrays from Polygon2Mask)
+        if 'gt_masks' in data and len(data['gt_masks']) > 0:
+            # Masks should be numpy arrays [H, W] from Polygon2Mask transform
+            mask_tensors = []
+            for mask in data['gt_masks']:
+                if isinstance(mask, np.ndarray):
+                    mask_tensors.append(torch.from_numpy(mask).float())
+                else:
+                    raise TypeError(f"Expected mask (numpy array), but got {type(mask)}. "
+                                  f"gt_masks should be masks (numpy arrays) from Polygon2Mask transform.")
+            data['gt_masks'] = mask_tensors
+        else:
             data['gt_masks'] = []
         
         return data

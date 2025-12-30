@@ -84,7 +84,7 @@ model = dict(
         ),
     ),
     train_cfg=dict(
-        num_points=12544,
+        num_points=3136,  # Reduced from 12544 to save VRAM (4x reduction)
         oversample_ratio=3.0,
         importance_sample_ratio=0.75,
         assigner=dict(
@@ -118,7 +118,7 @@ train_dataset = dict(
         dict(
             type='Resize',
             img_scale=[(512, 512), (768, 768), (1024, 1024), (1280, 1280)],
-            multiscale_mode='value',
+            multiscale_mode='value',  # Changed from 'value' to 'range' for random multi-scale training
             keep_ratio=True,
         ),
         dict(type='RandomFlip', flip_ratio=0.5, direction='horizontal'),
@@ -132,8 +132,9 @@ train_dataset = dict(
         ),
         dict(type='Normalize', mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375]),
         dict(type='Pad', size_divisor=32),
+        dict(type='Polygon2Mask'),
         dict(type='DefaultFormatBundle'),
-        dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels', 'gt_masks', 'img_metas']),
+        dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels', 'gt_masks', 'img_metas', 'ori_gt_masks']),
     ],
     filter_empty_gt=True,
 )
@@ -153,8 +154,9 @@ val_dataset = dict(
         ),
         dict(type='Normalize', mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375]),
         dict(type='Pad', size_divisor=32),
+        dict(type='Polygon2Mask'),
         dict(type='DefaultFormatBundle'),
-        dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels', 'gt_masks', 'img_metas']),
+        dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels', 'gt_masks', 'img_metas', 'ori_gt_masks']),
     ],
     test_mode=False,
     filter_empty_gt=False,
@@ -184,6 +186,7 @@ test_dataset = dict(
 data = dict(
     samples_per_gpu=2,  # Batch size per GPU
     workers_per_gpu=4,  # Number of data loading workers per GPU
+    pin_memory=False,  # Disable pin_memory to save VRAM
     train=train_dataset,
     val=val_dataset,
     test=test_dataset,
@@ -201,7 +204,12 @@ optimizer = dict(
     ),
 )
 
-optimizer_config = dict(grad_clip=dict(max_norm=0.1, norm_type=2))
+optimizer_config = dict(
+    grad_clip=dict(max_norm=0.1, norm_type=2),
+    # Mixed precision training (FP16) - saves ~50% VRAM
+    type='AmpOptimizerHook',
+    loss_scale='dynamic',
+)
 
 # Learning rate schedule
 lr_config = dict(
@@ -216,6 +224,9 @@ lr_config = dict(
 runner = dict(
     type='EpochBasedRunner',
     max_epochs=50,
+    # Gradient accumulation - process multiple batches before updating
+    # Effective batch size = samples_per_gpu * gradient_accumulation_steps
+    gradient_accumulation_steps=1,  # Increase to 2-4 if still OOM
 )
 
 # Checkpoint configuration

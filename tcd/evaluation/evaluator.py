@@ -9,6 +9,8 @@ from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
 import json
 import re
+import cv2
+import os
 
 
 class WeightedMAPEvaluator:
@@ -361,6 +363,7 @@ class WeightedMAPEvaluator:
         img_prefix: str = '',
         device: str = 'cuda',
         return_images: bool = False,
+        ori_gt_masks: Optional[List[List]] = None,  # Original polygons (from data loader)
     ):
         """Evaluate a batch of predictions.
         
@@ -377,9 +380,6 @@ class WeightedMAPEvaluator:
         Returns:
             List of visualization dicts if return_images=True
         """
-        import cv2
-        import os
-        
         # Post-process predictions
         pred_results = self.post_process_predictions(
             pred_logits,
@@ -393,22 +393,47 @@ class WeightedMAPEvaluator:
         for i, pred_result in enumerate(pred_results):
             # Get ground truth for this image
             gt_labels_i = gt_labels[i].cpu().numpy()
-            gt_masks_i = gt_masks[i].cpu().numpy()  # [num_instances, H, W]
+            gt_masks_i = gt_masks[i].cpu().numpy()  # [num_instances, H, W] - processed masks
             
-            # Resize GT masks to original size if needed
+            # Get original image size
             img_meta = img_metas[i]
             ori_h, ori_w = img_meta.get('ori_shape', img_meta.get('img_shape', (1024, 1024)))
             
-            if gt_masks_i.shape[0] > 0 and gt_masks_i.shape[-2:] != (ori_h, ori_w):
-                gt_masks_i = F.interpolate(
-                    torch.from_numpy(gt_masks_i).unsqueeze(1).float(),
-                    size=(ori_h, ori_w),
-                    mode='bilinear',
-                    align_corners=False,
-                ).squeeze(1).numpy()
+            # Use original masks (from data loader) - should always be available
+            # ori_gt_masks are already masks at original size (generated in LoadAnnotations)
+            if ori_gt_masks is None:
+                raise ValueError(
+                    "ori_gt_masks is None. This should not happen - "
+                    "the dataset should always provide ori_gt_masks. "
+                    "Check that Collect transform preserves ori_gt_masks."
+                )
             
-            # Convert to list
-            gt_masks_list = [gt_masks_i[j] for j in range(len(gt_labels_i))]
+            if i >= len(ori_gt_masks):
+                raise ValueError(
+                    f"Index {i} out of range for ori_gt_masks (length {len(ori_gt_masks)}). "
+                    "Batch size mismatch between predictions and ground truth."
+                )
+            
+            # ori_gt_masks are already masks (tensors) at original size from collate_fn
+            # Format: List[List[Tensor]] - one list per image, each containing mask tensors [H, W]
+            gt_masks_list = []
+            for mask in ori_gt_masks[i]:
+                if not isinstance(mask, torch.Tensor):
+                    raise TypeError(
+                        f"Expected ori_gt_masks to be tensors, but got {type(mask)}. "
+                        f"Check that collate_fn converts ori_gt_masks to tensors."
+                    )
+                # Convert tensor to numpy
+                mask_np = mask.cpu().numpy()
+                # Verify size matches original image size
+                if mask_np.shape != (ori_h, ori_w):
+                    raise ValueError(
+                        f"ori_gt_masks size mismatch: expected {(ori_h, ori_w)}, got {mask_np.shape}. "
+                        f"ori_gt_masks should be at original image size from LoadAnnotations."
+                    )
+                gt_masks_list.append(mask_np.astype(np.float32))
+            
+            # Convert labels to 1-indexed (for visualization: 1=individual_tree, 2=group_of_trees)
             gt_labels_list = (gt_labels_i + 1).tolist()  # Convert to 1-indexed
             
             # Extract scene type and resolution

@@ -4,6 +4,7 @@ Training script for Tree Canopy Detection.
 
 import argparse
 import os
+import logging
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -20,6 +21,13 @@ from tcd.configs import tcd_config
 from tcd.evaluation import WeightedMAPEvaluator
 from tcd.utils.runner import Runner
 from tcd.utils.hooks import TextLoggerHook, WandbHook
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
 def parse_args():
@@ -100,6 +108,9 @@ def build_dataloader(dataset, cfg, mode='train', distributed=False):
         sampler = None
         shuffle = (mode == 'train')
     
+    # Get pin_memory setting from config (default False to save VRAM)
+    pin_memory = cfg.get('data', {}).get('pin_memory', False)
+    
     dataloader = DataLoader(
         dataset,
         batch_size=samples_per_gpu,
@@ -107,7 +118,7 @@ def build_dataloader(dataset, cfg, mode='train', distributed=False):
         collate_fn=collate_fn,
         sampler=sampler,
         num_workers=workers_per_gpu,
-        pin_memory=True,
+        pin_memory=pin_memory,
         drop_last=(mode == 'train'),
     )
     return dataloader
@@ -155,6 +166,13 @@ def train_epoch(runner, dataloader, cfg, distributed=False):
     total_loss = 0.0
     num_batches = 0
     
+    # Mixed precision training (FP16) - saves ~50% VRAM
+    use_amp = cfg.get('optimizer_config', {}).get('type') == 'AmpOptimizerHook'
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    
+    # Gradient accumulation
+    accumulation_steps = cfg.get('runner', {}).get('gradient_accumulation_steps', 1)
+    
     # Call before_train_epoch hook
     runner.call_hook('before_train_epoch')
     
@@ -176,14 +194,24 @@ def train_epoch(runner, dataloader, cfg, distributed=False):
         gt_masks = [mask.cuda() for mask in data['gt_masks']]
         img_metas = data['img_metas']
         
-        # Forward
-        losses = runner.model(
-            img=img,
-            img_metas=img_metas,
-            gt_bboxes=gt_bboxes,
-            gt_labels=gt_labels,
-            gt_masks=gt_masks,
-        )
+        # Forward with mixed precision
+        if use_amp:
+            with torch.cuda.amp.autocast():
+                losses = runner.model(
+                    img=img,
+                    img_metas=img_metas,
+                    gt_bboxes=gt_bboxes,
+                    gt_labels=gt_labels,
+                    gt_masks=gt_masks,
+                )
+        else:
+            losses = runner.model(
+                img=img,
+                img_metas=img_metas,
+                gt_bboxes=gt_bboxes,
+                gt_labels=gt_labels,
+                gt_masks=gt_masks,
+            )
         
         # Compute total loss
         if isinstance(losses, dict):
@@ -191,20 +219,40 @@ def train_epoch(runner, dataloader, cfg, distributed=False):
         else:
             loss = losses
         
-        # Backward
-        runner.optimizer.zero_grad()
-        loss.backward()
+        # Scale loss for gradient accumulation
+        loss = loss / accumulation_steps
         
-        # Gradient clipping
-        if 'optimizer_config' in cfg and 'grad_clip' in cfg['optimizer_config']:
-            torch.nn.utils.clip_grad_norm_(
-                runner.model.parameters(),
-                **cfg['optimizer_config']['grad_clip'],
-            )
+        # Backward with mixed precision
+        if use_amp:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
         
-        runner.optimizer.step()
+        # Update weights only after accumulating gradients
+        if (batch_idx + 1) % accumulation_steps == 0:
+            # Gradient clipping
+            if 'optimizer_config' in cfg and 'grad_clip' in cfg['optimizer_config']:
+                if use_amp:
+                    scaler.unscale_(runner.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    runner.model.parameters(),
+                    **cfg['optimizer_config']['grad_clip'],
+                )
+            
+            # Optimizer step
+            if use_amp:
+                scaler.step(runner.optimizer)
+                scaler.update()
+            else:
+                runner.optimizer.step()
+            
+            runner.optimizer.zero_grad()
+            
+            # Clear cache periodically
+            if batch_idx % 10 == 0:
+                torch.cuda.empty_cache()
         
-        total_loss += loss.item()
+        total_loss += loss.item() * accumulation_steps  # Scale back for logging
         num_batches += 1
         
         # Update iteration counter
@@ -225,14 +273,21 @@ def train_epoch(runner, dataloader, cfg, distributed=False):
 def main():
     args = parse_args()
     
+    logger.info('Starting training script...')
+    logger.info(f'Config file: {args.config}')
+    
     # Load config (returns plain dict)
     if args.config.endswith('.py'):
+        logger.info('Loading config file...')
         cfg = Config.fromfile(args.config, return_dict=True)
+        logger.info('Config loaded')
     else:
         # Use default config (convert to dict)
+        logger.info('Using default config...')
         cfg = Config(tcd_config.__dict__).to_dict()
     
     # Set random seed
+    logger.info('Setting random seed...')
     set_random_seed(cfg.get('seed', 42), cfg.get('deterministic', False))
     
     # Setup distributed training
@@ -269,26 +324,47 @@ def main():
     
     if rank == 0:
         os.makedirs(work_dir, exist_ok=True)
-        print(f'Experiment directory: {work_dir}')
+        logger.info(f'Experiment directory: {work_dir}')
     
     # Synchronize all processes before continuing
     if distributed:
         dist.barrier()
     
+    if rank == 0:
+        logger.info('Building model...')
     # Build model
     model = build_model(cfg)
+    if rank == 0:
+        logger.info('Model built. Moving to GPU...')
+        # Print model architecture
+        logger.info('Model architecture:')
+        print(model)
     model = model.cuda()
     
     if distributed:
+        if rank == 0:
+            logger.info('Wrapping model with DDP...')
         model = DDP(model, device_ids=[rank])
     
+    if rank == 0:
+        logger.info('Building datasets...')
     # Build datasets
     train_dataset = build_dataset(cfg, mode='train')
+    if rank == 0:
+        logger.info(f'Train dataset built: {len(train_dataset)} samples')
     val_dataset = build_dataset(cfg, mode='val')
+    if rank == 0:
+        logger.info(f'Val dataset built: {len(val_dataset)} samples')
     
+    if rank == 0:
+        logger.info('Building dataloaders...')
     # Build dataloaders
     train_loader = build_dataloader(train_dataset, cfg, mode='train', distributed=distributed)
+    if rank == 0:
+        logger.info(f'Train dataloader built: {len(train_loader)} batches')
     val_loader = build_dataloader(val_dataset, cfg, mode='val', distributed=distributed)
+    if rank == 0:
+        logger.info(f'Val dataloader built: {len(val_loader)} batches')
     
     # Build optimizer
     optimizer = build_optimizer(model.module if distributed else model, cfg)
@@ -302,6 +378,8 @@ def main():
         rank=rank,
     )
     
+    if rank == 0:
+        logger.info('Registering hooks...')
     # Register hooks
     log_config = cfg.get('log_config', {})
     log_interval = log_config.get('interval', 10)
@@ -313,6 +391,7 @@ def main():
     
     # Wandb hook (only register on rank 0)
     if rank == 0 and ('WandbHook' in hooks_list or 'wandb' in hooks_list):
+        logger.info('Initializing Wandb hook...')
         wandb_config = log_config.get('wandb', {})
         wandb_hook = WandbHook(
             init_kwargs=wandb_config.get('init_kwargs', {}),
@@ -321,7 +400,10 @@ def main():
             work_dir=work_dir,
         )
         runner.register_hook(wandb_hook)
+        logger.info('Wandb hook registered')
     
+    if rank == 0:
+        logger.info('Starting training loop...')
     # Training loop
     max_epochs = cfg['runner']['max_epochs']
     for epoch in range(max_epochs):
@@ -365,6 +447,14 @@ def main():
                         )
                         
                         # Evaluate batch (with visualization - loads original images from disk)
+                        # Pass original masks from data loader for accurate evaluation
+                        # ori_gt_masks are masks (tensors) at original size from collate_fn
+                        if 'ori_gt_masks' not in data:
+                            raise ValueError(
+                                "ori_gt_masks not found in data. "
+                                "Check that Collect transform includes ori_gt_masks in keys."
+                            )
+                        ori_gt_masks = data['ori_gt_masks']
                         val_images = evaluator.evaluate_batch(
                             outputs['pred_logits'],
                             outputs['pred_masks'],
@@ -373,6 +463,7 @@ def main():
                             img_metas,
                             img_prefix=img_prefix,
                             return_images=True,
+                            ori_gt_masks=ori_gt_masks,  # Use original polygons for evaluation
                         )
                         
                         if val_images:
@@ -398,7 +489,7 @@ def main():
                 }
                 checkpoint_path = os.path.join(work_dir, f'epoch_{epoch+1}.pth')
                 torch.save(checkpoint, checkpoint_path)
-                print(f'Checkpoint saved to {checkpoint_path}')
+                logger.info(f'Checkpoint saved to {checkpoint_path}')
     
     if distributed:
         dist.destroy_process_group()
