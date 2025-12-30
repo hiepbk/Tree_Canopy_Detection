@@ -236,21 +236,44 @@ def main():
     set_random_seed(cfg.get('seed', 42), cfg.get('deterministic', False))
     
     # Setup distributed training
-    distributed = args.gpus > 1
-    if distributed:
+    # Check if running in distributed mode (torchrun sets these env vars)
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        # torchrun automatically sets up distributed
+        distributed = True
+        rank = int(os.environ['RANK'])
+        local_rank = int(os.environ.get('LOCAL_RANK', rank))
+        world_size = int(os.environ['WORLD_SIZE'])
+        
+        # Initialize process group if not already initialized
+        if not dist.is_initialized():
+            dist.init_process_group(backend='nccl')
+        
+        torch.cuda.set_device(local_rank)
+    elif args.gpus > 1:
+        # Manual distributed setup (if not using torchrun)
+        distributed = True
         dist.init_process_group(backend='nccl')
         rank = dist.get_rank()
-        torch.cuda.set_device(rank)
+        local_rank = int(os.environ.get('LOCAL_RANK', rank))
+        torch.cuda.set_device(local_rank)
     else:
+        distributed = False
         rank = 0
+        local_rank = 0
     
-    # Create work directory with timestamp
+    # Create work directory with timestamp (only on rank 0)
     from datetime import datetime
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    base_work_dir = args.work_dir
+    base_work_dir = args.work_dir if args.work_dir else 'work_dirs'
     work_dir = os.path.join(base_work_dir, f'exp_{timestamp}')
-    os.makedirs(work_dir, exist_ok=True)
-    print(f'Experiment directory: {work_dir}')
+    
+    if rank == 0:
+        os.makedirs(work_dir, exist_ok=True)
+        print(f'Experiment directory: {work_dir}')
+    
+    # Synchronize all processes before continuing
+    if distributed:
+        dist.barrier()
     
     # Build model
     model = build_model(cfg)
@@ -288,8 +311,8 @@ def main():
     text_logger = TextLoggerHook(interval=log_interval)
     runner.register_hook(text_logger)
     
-    # Wandb hook
-    if 'WandbHook' in hooks_list or 'wandb' in hooks_list:
+    # Wandb hook (only register on rank 0)
+    if rank == 0 and ('WandbHook' in hooks_list or 'wandb' in hooks_list):
         wandb_config = log_config.get('wandb', {})
         wandb_hook = WandbHook(
             init_kwargs=wandb_config.get('init_kwargs', {}),

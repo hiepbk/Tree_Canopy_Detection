@@ -358,41 +358,51 @@ During the competition, the **Public score**, calculated with about 35% of the e
    pip install torch==2.1.0+cu121 torchvision==0.16.0+cu121 torchaudio==2.1.0+cu121
    ```
 
-2. **Install mmcv with CUDA support**:
-   ```bash
-   pip install mmcv==2.1.0 -f https://download.openmmlab.com/mmcv/dist/cu121/torch2.1.0/index.html
-   ```
-
-3. **Install all other dependencies**:
+2. **Install all other dependencies**:
    ```bash
    pip install -r requirements.txt
    ```
 
-4. **Install MMDetection in editable mode**:
+3. **Install the package in editable mode**:
    ```bash
-   pip install -e . --no-build-isolation
+   pip install -e .
+   ```
+
+4. **Install Weights & Biases** (for logging and visualization):
+   ```bash
+   pip install wandb
+   wandb login  # Follow prompts to enter your API key
    ```
 
 ### Setup Workflow
 
 1. **Download the dataset** from the Solafune competition platform
-2. **Convert data to COCO format**:
-   ```bash
-   python tools/dataset_converters/tree_canopy2coco.py \
-       --input data/Tree_Canopy_Data/raw_data/trainval_annotations.json \
-       --output-dir data/Tree_Canopy_Data \
-       --train-ratio 0.8 \
-       --seed 42
+2. **Organize your data** in the following structure:
    ```
+   data/Tree_Canopy_Data/
+   ├── images/
+   │   ├── train/
+   │   └── val/
+   └── annotations/
+       ├── train.json
+       └── val.json
+   ```
+
 3. **Train the model** (single GPU):
    ```bash
-   python tools/train.py configs/mask2former/mask2former_swin-b-p4-w12-384-in21k_8xb2-lsj-50e_tree_canopy.py
+   python tools/train.py tcd/configs/tcd_config.py --work-dir work_dirs/tcd_exp1
    ```
    
-   **Train the model** (4 GPUs with WandB logging):
+   **Train the model** (multi-GPU, e.g., 4 GPUs):
    ```bash
-   bash tools/dist_train.sh configs/mask2former/mask2former_swin-b-p4-w12-384-in21k_8xb2-lsj-50e_tree_canopy.py 4
+   torchrun --nproc_per_node=4 tools/train.py tcd/configs/tcd_config.py --work-dir work_dirs/tcd_exp1 --gpus 4
    ```
+   
+   **Optional arguments:**
+   - `--resume-from <checkpoint_path>`: Resume training from a checkpoint
+   - `--load-from <pretrained_path>`: Load pretrained weights
+   - `--seed <number>`: Set random seed (default: 42)
+   - `--deterministic`: Use deterministic algorithms
 
 ### ⚠️ Small Dataset Strategy: Handling 108 Samples with ~298 Instances per Image
 
@@ -425,10 +435,13 @@ During the competition, the **Public score**, calculated with about 35% of the e
 **Training Command:**
 ```bash
 # Single GPU
-python tools/train.py configs/mask2former/mask2former_swin-t-p4-w7-224_8xb2-lsj-50e_tree_canopy.py
+python tools/train.py tcd/configs/tcd_config.py
 
-# 4 GPUs
-bash tools/dist_train.sh configs/mask2former/mask2former_swin-t-p4-w7-224_8xb2-lsj-50e_tree_canopy.py 4
+# 4 GPUs (using torchrun)
+torchrun --nproc_per_node=4 tools/train.py tcd/configs/tcd_config.py
+
+# 4 GPUs (alternative - using torch.distributed.launch)
+python -m torch.distributed.launch --nproc_per_node=4 tools/train.py tcd/configs/tcd_config.py
 ```
 
 #### 2. Aggressive Data Augmentation (Critical)
