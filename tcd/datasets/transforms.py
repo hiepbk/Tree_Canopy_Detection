@@ -391,6 +391,11 @@ class DefaultFormatBundle:
             img = torch.from_numpy(img).float()
         data['img'] = img
         
+        # Preserve original image (keep as numpy array for visualization)
+        if 'ori_img' in data:
+            # ori_img should remain as numpy array [H, W, C] RGB
+            pass  # Keep as is
+        
         # Convert bboxes to tensor
         if 'gt_bboxes' in data and len(data['gt_bboxes']) > 0:
             data['gt_bboxes'] = torch.from_numpy(data['gt_bboxes']).float()

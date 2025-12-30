@@ -58,15 +58,27 @@ class WeightedMAPEvaluator:
     def compute_mask_iou(self, pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
         """Compute IoU between two binary masks.
         
+        Optimized version using direct boolean operations.
+        
         Args:
-            pred_mask: Binary prediction mask [H, W]
-            gt_mask: Binary ground truth mask [H, W]
+            pred_mask: Binary prediction mask [H, W] (bool or 0/1)
+            gt_mask: Binary ground truth mask [H, W] (bool or 0/1)
             
         Returns:
             IoU score
         """
-        intersection = np.logical_and(pred_mask, gt_mask).sum()
-        union = np.logical_or(pred_mask, gt_mask).sum()
+        # Ensure boolean masks for faster operations
+        if pred_mask.dtype != bool:
+            pred_mask = pred_mask > 0.5
+        if gt_mask.dtype != bool:
+            gt_mask = gt_mask > 0.5
+        
+        # Compute intersection and union using bitwise operations (faster)
+        # intersection = (pred_mask & gt_mask).sum()
+        # union = (pred_mask | gt_mask).sum()
+        # But for numpy, logical operations are faster for boolean arrays
+        intersection = np.sum(pred_mask & gt_mask)
+        union = np.sum(pred_mask | gt_mask)
         
         if union == 0:
             return 0.0
@@ -152,38 +164,92 @@ class WeightedMAPEvaluator:
                 continue
             
             # Match predictions to ground truth
-            tp = [False] * len(pred_indices)
-            used_gt = [False] * len(gt_indices)
+            # Memory-efficient vectorized IoU computation
+            num_preds = len(pred_indices)
+            num_gts = len(gt_indices)
             
-            # Sort predictions by score
-            pred_scores_class = [pred_scores[i] for i in pred_indices]
-            sorted_pred_indices = sorted(
-                range(len(pred_indices)),
-                key=lambda i: pred_scores_class[i],
-                reverse=True
-            )
-            
-            # Greedy matching: assign each prediction to best unmatched GT
-            for pred_idx in sorted_pred_indices:
-                pred_mask = pred_masks[pred_indices[pred_idx]]
-                best_iou = 0.0
-                best_gt_idx = -1
+            if num_preds == 0 or num_gts == 0:
+                # No matching possible
+                tp = [False] * num_preds
+            else:
+                # Convert masks to boolean and flatten for efficient computation
+                pred_masks_flat = []
+                pred_sums = []
+                for i in pred_indices:
+                    mask = pred_masks[i]
+                    if mask.dtype != bool:
+                        mask = mask > 0.5
+                    pred_masks_flat.append(mask.flatten())  # Flatten to 1D
+                    pred_sums.append(np.sum(mask))
                 
-                for gt_idx in range(len(gt_indices)):
-                    if used_gt[gt_idx]:
-                        continue
-                    
-                    gt_mask = gt_masks[gt_indices[gt_idx]]
-                    iou = self.compute_mask_iou(pred_mask, gt_mask)
-                    
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_gt_idx = gt_idx
+                gt_masks_flat = []
+                gt_sums = []
+                for i in gt_indices:
+                    mask = gt_masks[i]
+                    if mask.dtype != bool:
+                        mask = mask > 0.5
+                    gt_masks_flat.append(mask.flatten())  # Flatten to 1D
+                    gt_sums.append(np.sum(mask))
                 
-                # If IoU > threshold, mark as true positive
-                if best_iou >= self.iou_threshold and best_gt_idx >= 0:
-                    tp[pred_idx] = True
-                    used_gt[best_gt_idx] = True
+                # Stack flattened masks: [num_preds, H*W] and [num_gts, H*W]
+                pred_masks_array = np.stack(pred_masks_flat, axis=0)  # [num_preds, H*W]
+                gt_masks_array = np.stack(gt_masks_flat, axis=0)  # [num_gts, H*W]
+                
+                # Convert to float32 for matrix multiplication (more efficient than boolean operations)
+                pred_masks_float = pred_masks_array.astype(np.float32)  # [num_preds, H*W]
+                gt_masks_float = gt_masks_array.astype(np.float32)  # [num_gts, H*W]
+                
+                # Compute intersection matrix using matrix multiplication (much faster!)
+                # pred_masks_float @ gt_masks_float.T = [num_preds, H*W] @ [H*W, num_gts] = [num_preds, num_gts]
+                # This computes sum(pred * gt) for each pair, which is the intersection
+                intersection_matrix = pred_masks_float @ gt_masks_float.T  # [num_preds, num_gts]
+                
+                # Convert sums to arrays
+                pred_sums_array = np.array(pred_sums, dtype=np.float32)  # [num_preds]
+                gt_sums_array = np.array(gt_sums, dtype=np.float32)  # [num_gts]
+                
+                # Compute union using broadcasting
+                pred_sums_expanded = pred_sums_array[:, None]  # [num_preds, 1]
+                gt_sums_expanded = gt_sums_array[None, :]  # [1, num_gts]
+                
+                # Union = pred_sum + gt_sum - intersection
+                union_matrix = pred_sums_expanded + gt_sums_expanded - intersection_matrix  # [num_preds, num_gts]
+                
+                # Compute IoU matrix (avoid division by zero)
+                iou_matrix = np.divide(
+                    intersection_matrix,
+                    union_matrix,
+                    out=np.zeros_like(intersection_matrix, dtype=np.float32),
+                    where=union_matrix > 0
+                )  # [num_preds, num_gts]
+                
+                # Greedy matching: assign each prediction to best unmatched GT
+                tp = [False] * num_preds
+                used_gt = [False] * num_gts
+                
+                # Sort predictions by score (descending)
+                pred_scores_class = [pred_scores[i] for i in pred_indices]
+                sorted_pred_indices = sorted(
+                    range(num_preds),
+                    key=lambda i: pred_scores_class[i],
+                    reverse=True
+                )
+                
+                for pred_idx in sorted_pred_indices:
+                    # Get IoUs for this prediction
+                    ious = iou_matrix[pred_idx, :]  # [num_gts]
+                    
+                    # Mask out already used GTs (set to -1 so they won't be selected)
+                    ious_masked = np.where(used_gt, -1.0, ious)
+                    
+                    # Find best unmatched GT
+                    best_gt_idx = np.argmax(ious_masked)
+                    best_iou = ious_masked[best_gt_idx]
+                    
+                    # If IoU > threshold, mark as true positive
+                    if best_iou >= self.iou_threshold:
+                        tp[pred_idx] = True
+                        used_gt[best_gt_idx] = True
             
             # Compute AP for this class
             tp_list = [tp[i] for i in sorted_pred_indices]
@@ -363,7 +429,8 @@ class WeightedMAPEvaluator:
         img_prefix: str = '',
         device: str = 'cuda',
         return_images: bool = False,
-        ori_gt_masks: Optional[List[List]] = None,  # Original polygons (from data loader)
+        ori_gt_masks: Optional[List[List]] = None,  # Original masks (from data loader)
+        ori_imgs: Optional[List] = None,  # Original images (from data loader)
     ):
         """Evaluate a batch of predictions.
         
@@ -439,12 +506,13 @@ class WeightedMAPEvaluator:
             # Extract scene type and resolution
             scene_type, resolution = self.extract_metadata(img_meta)
             
-            # Add to evaluator
+            # pred_result['masks'] are already at original size (interpolated in post_process_predictions)
+            # Use them directly for metric calculation
             self.add_prediction(
-                pred_masks=pred_result['masks'],
+                pred_masks=pred_result['masks'],  # Already at original size
                 pred_labels=pred_result['labels'],
                 pred_scores=pred_result['scores'],
-                gt_masks=gt_masks_list,
+                gt_masks=gt_masks_list,  # Already at original size
                 gt_labels=gt_labels_list,
                 scene_type=scene_type,
                 resolution=resolution,
@@ -452,26 +520,44 @@ class WeightedMAPEvaluator:
             
             # Prepare visualization data if requested
             if return_images:
-                # Load original image from disk
-                filename = img_meta.get('filename', '')
-                if filename and img_prefix:
-                    img_path = os.path.join(img_prefix, filename)
-                    if os.path.exists(img_path):
-                        # Load original image
-                        original_img = cv2.imread(img_path)
-                        if original_img is not None:
-                            original_img = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
-                            # Resize to original shape if needed
-                            if original_img.shape[:2] != (ori_h, ori_w):
-                                original_img = cv2.resize(original_img, (ori_w, ori_h), interpolation=cv2.INTER_LINEAR)
-                            
-                            val_images.append({
-                                'image': original_img,
-                                'pred_masks': pred_result['masks'],
-                                'gt_masks': gt_masks_list,
-                                'pred_labels': pred_result['labels'],
-                                'gt_labels': gt_labels_list,
-                            })
+                # Get original image from data loader (not from disk)
+                if ori_imgs is None:
+                    raise ValueError(
+                        "ori_imgs is None. Check that ori_img is included in Collect transform keys."
+                    )
+                
+                if i >= len(ori_imgs):
+                    raise ValueError(
+                        f"Index {i} out of range for ori_imgs (length {len(ori_imgs)}). "
+                        "Batch size mismatch."
+                    )
+                
+                original_img = ori_imgs[i]
+                # Original image should be numpy array [H, W, 3] RGB format from dataset
+                if not isinstance(original_img, np.ndarray):
+                    raise TypeError(f"Expected original image to be numpy array, but got {type(original_img)}")
+                
+                # Verify image size matches original
+                if original_img.shape[:2] != (ori_h, ori_w):
+                    original_img = cv2.resize(original_img, (ori_w, ori_h), interpolation=cv2.INTER_LINEAR)
+                
+                # Ensure RGB format (dataset loads as RGB)
+                if original_img.shape[2] == 3:
+                    original_img_rgb = original_img.copy()
+                else:
+                    raise ValueError(f"Expected image with 3 channels, but got {original_img.shape[2]} channels")
+                
+                # Get filename from img_meta
+                filename = img_meta.get('filename', f'image_{i}.jpg')
+                
+                val_images.append({
+                    'original_image': original_img_rgb,  # Original image from data loader [H, W, 3] RGB
+                    'original_mask': gt_masks_list,  # Original masks at original size
+                    'pred_masks': pred_result['masks'],  # Already at original size (interpolated in post_process_predictions)
+                    'pred_labels': pred_result['labels'],
+                    'gt_labels': gt_labels_list,
+                    'filename': filename,  # Filename for caption
+                })
         
         if return_images:
             return val_images

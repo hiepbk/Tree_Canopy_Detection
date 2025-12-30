@@ -4,7 +4,7 @@ Training hooks for logging and monitoring.
 
 import torch
 import numpy as np
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from abc import ABC, abstractmethod
 import os
 import io
@@ -14,6 +14,7 @@ import matplotlib.patches as patches
 from matplotlib.collections import PatchCollection
 import cv2
 import io
+import time
 
 
 class Hook:
@@ -54,6 +55,7 @@ class TextLoggerHook(Hook):
         super().__init__(priority=50)
         self.interval = interval
         self.ignore_last = ignore_last
+        
     
     def before_train_epoch(self, runner):
         pass
@@ -66,6 +68,7 @@ class TextLoggerHook(Hook):
     def before_train_iter(self, runner, batch_idx, data):
         pass
     
+    
     def after_train_iter(self, runner, batch_idx, data, outputs):
         if runner.rank == 0 and batch_idx % self.interval == 0:
             if isinstance(outputs, dict):
@@ -77,17 +80,29 @@ class TextLoggerHook(Hook):
     
     def before_val_epoch(self, runner):
         if runner.rank == 0:
-            print(f'Evaluating on validation set...')
+            print(f'=='*10 + 'Evaluating on validation set...' + '=='*10)
+            # Set the timer start
+            self.eval_start_time = time.perf_counter()
     
     def after_val_epoch(self, runner, metrics):
         if runner.rank == 0:
-            print(f'Evaluation Results:')
+            # Calculate evaluation time
+            self.eval_end_time = time.perf_counter()
+            eval_time = self.eval_end_time - self.eval_start_time
+            
+            print(f'=='*10 + 'Evaluation Results:' + '=='*10)
             print(f'  Weighted mAP: {metrics.get("weighted_map", 0.0):.4f}')
             print(f'  Mean mAP: {metrics.get("mean_map", 0.0):.4f}')
             class_aps = metrics.get('class_aps', [])
             class_names = metrics.get('class_names', [])
             for name, ap in zip(class_names, class_aps):
                 print(f'  {name} AP: {ap:.4f}')
+            
+            # Display time in appropriate units
+            if eval_time < 1.0:
+                print(f'  Evaluation time: {eval_time * 1000:.2f} ms')
+            else:
+                print(f'  Evaluation time: {eval_time:.2f} s ({eval_time * 1000:.2f} ms)')
 
 
 class WandbHook(Hook):
@@ -195,24 +210,25 @@ class WandbHook(Hook):
         }
         
         for i, img_data in enumerate(val_images[:self.num_eval_images]):
-            image = img_data['image']  # [H, W, 3] numpy array (RGB) at original size
-            pred_masks = img_data['pred_masks']  # List of numpy arrays [H, W] from evaluator
-            gt_masks = img_data['gt_masks']  # List of numpy arrays [H, W] at original size from ori_gt_masks
+            # Data from evaluator: all at original size, ready to draw
+            original_image = img_data['original_image']  # [H, W, 3] numpy array (RGB) at original size
+            original_mask = img_data['original_mask']  # List of numpy arrays [H, W] at original size
+            pred_masks = img_data['pred_masks']  # List of numpy arrays [H, W] at original size (already interpolated)
             pred_labels = img_data['pred_labels']  # List of labels
             gt_labels = img_data['gt_labels']  # List of labels
             
             # Verify formats - no fallbacks
-            if not isinstance(gt_masks, list):
-                raise TypeError(f"Expected gt_masks to be a list, but got {type(gt_masks)}")
+            if not isinstance(original_mask, list):
+                raise TypeError(f"Expected original_mask to be a list, but got {type(original_mask)}")
             if not isinstance(pred_masks, list):
                 raise TypeError(f"Expected pred_masks to be a list, but got {type(pred_masks)}")
             
             # Verify mask formats
-            for j, mask in enumerate(gt_masks):
+            for j, mask in enumerate(original_mask):
                 if not isinstance(mask, np.ndarray):
-                    raise TypeError(f"Expected gt_masks[{j}] to be numpy array, but got {type(mask)}")
+                    raise TypeError(f"Expected original_mask[{j}] to be numpy array, but got {type(mask)}")
                 if mask.ndim != 2:
-                    raise ValueError(f"Expected gt_masks[{j}] to be 2D [H, W], but got shape {mask.shape}")
+                    raise ValueError(f"Expected original_mask[{j}] to be 2D [H, W], but got shape {mask.shape}")
             
             for j, mask in enumerate(pred_masks):
                 if not isinstance(mask, np.ndarray):
@@ -221,93 +237,106 @@ class WandbHook(Hook):
                     raise ValueError(f"Expected pred_masks[{j}] to be 2D [H, W], but got shape {mask.shape}")
             
             # Verify labels match masks length
-            if len(gt_labels) != len(gt_masks):
-                raise ValueError(f"gt_labels length ({len(gt_labels)}) != gt_masks length ({len(gt_masks)})")
+            if len(gt_labels) != len(original_mask):
+                raise ValueError(f"gt_labels length ({len(gt_labels)}) != original_mask length ({len(original_mask)})")
             if len(pred_labels) != len(pred_masks):
                 raise ValueError(f"pred_labels length ({len(pred_labels)}) != pred_masks length ({len(pred_masks)})")
             
             # Convert RGB to BGR for OpenCV
-            image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            image_bgr = cv2.cvtColor(original_image, cv2.COLOR_RGB2BGR)
             img_h, img_w = image_bgr.shape[:2]
             
             # Verify image and masks are at same size (all at original size)
-            for j, mask in enumerate(gt_masks):
+            for j, mask in enumerate(original_mask):
                 if mask.shape != (img_h, img_w):
                     raise ValueError(
-                        f"GT mask {j} shape {mask.shape} doesn't match image shape {(img_h, img_w)}. "
-                        f"Masks should be at original size from ori_gt_masks."
+                        f"Original mask {j} shape {mask.shape} doesn't match image shape {(img_h, img_w)}. "
+                        f"Masks should be at original size."
                     )
             
-            # Overlay GT masks on image (masks are already at original size from ori_gt_masks)
-            gt_overlay = image_bgr.copy().astype(np.float32)
-            gt_mask_count = 0
-            for mask, label in zip(gt_masks, gt_labels):
-                # Mask is already numpy array [H, W] at original size (float32 from evaluator)
-                # Masks from LoadAnnotations are generated with cv2.fillPoly(..., 1.0), so they're 0.0 or 1.0
-                # But they might be in [0, 1] range, so check and ensure binary
-                if mask.max() > 1.0:
-                    mask_binary = (mask / 255.0 > 0.5).astype(np.float32)
-                else:
-                    # Already in [0, 1] range - threshold to get binary
-                    # Use lower threshold to catch masks that might be slightly less than 1.0
-                    mask_binary = (mask > 0.1).astype(np.float32)
-                
-                # Skip if mask is empty
-                if mask_binary.sum() == 0:
-                    continue
-                
-                gt_mask_count += 1
-                
-                color = class_colors.get(int(label), (0, 255, 255))
-                # Create colored overlay [H, W, 3]
-                mask_3d = np.stack([mask_binary] * 3, axis=2)
-                color_overlay = np.zeros((img_h, img_w, 3), dtype=np.float32)
-                color_overlay[:, :] = color
-                
-                # Transparent blending: result = image * (1 - alpha*mask) + color * alpha*mask
-                # Use lower alpha for more transparency
-                alpha = 0.3  # Transparency factor
-                gt_overlay = gt_overlay * (1 - alpha * mask_3d) + color_overlay * alpha * mask_3d
-            
-            # Debug: log if no GT masks were found
-            if gt_mask_count == 0 and len(gt_masks) > 0:
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.warning(f'No GT masks were overlayed (found {len(gt_masks)} masks, but all were empty after thresholding)')
-                # Log mask statistics for debugging
-                for idx, mask in enumerate(gt_masks[:3]):  # Log first 3 masks
-                    logger.warning(f'GT mask {idx}: shape={mask.shape}, dtype={mask.dtype}, min={mask.min()}, max={mask.max()}, sum={mask.sum()}')
-            
-            # Overlay predicted masks on image (resize to original size if needed)
-            pred_overlay = image_bgr.copy().astype(np.float32)
-            for mask, label in zip(pred_masks, pred_labels):
-                # Mask is numpy array [H, W] - resize to original size if needed
+            for j, mask in enumerate(pred_masks):
                 if mask.shape != (img_h, img_w):
-                    mask = cv2.resize(mask, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
+                    raise ValueError(
+                        f"Pred mask {j} shape {mask.shape} doesn't match image shape {(img_h, img_w)}. "
+                        f"Pred masks should already be at original size from evaluator."
+                    )
+            
+            # Merge all masks into single semantic mask (fully vectorized, no loops)
+            gt_overlay = image_bgr.copy()
+            if len(original_mask) > 0:
+                # Convert all masks to binary and stack: [num_masks, H, W] - vectorized
+                masks_binary = []
+                for mask in original_mask:
+                    if mask.dtype == bool:
+                        masks_binary.append(mask.astype(np.float32))
+                    elif mask.max() > 1.0:
+                        masks_binary.append((mask / 255.0 > 0.5).astype(np.float32))
+                    else:
+                        masks_binary.append((mask > 0.5).astype(np.float32))
                 
-                # Mask is already binary (0 or 1) from post_process_predictions (boolean array)
-                # Convert to float32 [0, 1]
-                if mask.dtype == bool:
-                    mask_binary = mask.astype(np.float32)
-                elif mask.max() > 1.0:
-                    mask_binary = (mask / 255.0 > 0.5).astype(np.float32)
-                else:
-                    mask_binary = (mask > 0.5).astype(np.float32)
+                if len(masks_binary) > 0:
+                    masks_array = np.stack(masks_binary, axis=0)  # [num_masks, H, W]
+                    labels_array = np.array([int(l) for l in gt_labels], dtype=np.int32)  # [num_masks]
+                    
+                    # Merge into single semantic mask (union): [H, W]
+                    merged_mask = np.max(masks_array, axis=0)
+                    
+                    # Create label map using argmax (last mask wins for overlaps): [H, W]
+                    # Reverse masks so last mask wins
+                    masks_reversed = masks_array[::-1]
+                    labels_reversed = labels_array[::-1]
+                    mask_indices = np.argmax(masks_reversed, axis=0)  # [H, W] - index of mask covering each pixel
+                    label_map = labels_reversed[mask_indices] * (merged_mask > 0).astype(np.int32)
+                    
+                    # Create color map from label map (vectorized)
+                    color_map = np.zeros((img_h, img_w, 3), dtype=np.float32)
+                    unique_labels = np.unique(label_map)
+                    for label_id in unique_labels:
+                        if label_id > 0:
+                            color = np.array(class_colors.get(label_id, (0, 255, 255)), dtype=np.float32)
+                            color_map[label_map == label_id] = color
+                    
+                    # Overlay merged semantic mask once
+                    if merged_mask.sum() > 0:
+                        gt_overlay = self.draw_instance_mask(gt_overlay, merged_mask, 0, color_map=color_map, alpha=0.7)
+            
+            # Merge all masks into single semantic mask (fully vectorized, no loops)
+            pred_overlay = image_bgr.copy()
+            if len(pred_masks) > 0:
+                # Convert all masks to binary and stack: [num_masks, H, W] - vectorized
+                masks_binary = []
+                for mask in pred_masks:
+                    if mask.dtype == bool:
+                        masks_binary.append(mask.astype(np.float32))
+                    elif mask.max() > 1.0:
+                        masks_binary.append((mask / 255.0 > 0.5).astype(np.float32))
+                    else:
+                        masks_binary.append((mask > 0.5).astype(np.float32))
                 
-                # Skip if mask is empty
-                if mask_binary.sum() == 0:
-                    continue
-                
-                color = class_colors.get(int(label), (0, 255, 255))
-                # Create colored overlay [H, W, 3]
-                mask_3d = np.stack([mask_binary] * 3, axis=2)
-                color_overlay = np.zeros((img_h, img_w, 3), dtype=np.float32)
-                color_overlay[:, :] = color
-                
-                # Transparent blending: result = image * (1 - alpha*mask) + color * alpha*mask
-                # Use lower alpha for more transparency
-                alpha = 0.3  # Transparency factor
-                pred_overlay = pred_overlay * (1 - alpha * mask_3d) + color_overlay * alpha * mask_3d
+                if len(masks_binary) > 0:
+                    masks_array = np.stack(masks_binary, axis=0)  # [num_masks, H, W]
+                    labels_array = np.array([int(l) for l in pred_labels], dtype=np.int32)  # [num_masks]
+                    
+                    # Merge into single semantic mask (union): [H, W]
+                    merged_mask = np.max(masks_array, axis=0)
+                    
+                    # Create label map using argmax (last mask wins for overlaps): [H, W]
+                    masks_reversed = masks_array[::-1]
+                    labels_reversed = labels_array[::-1]
+                    mask_indices = np.argmax(masks_reversed, axis=0)  # [H, W]
+                    label_map = labels_reversed[mask_indices] * (merged_mask > 0).astype(np.int32)
+                    
+                    # Create color map from label map (vectorized)
+                    color_map = np.zeros((img_h, img_w, 3), dtype=np.float32)
+                    unique_labels = np.unique(label_map)
+                    for label_id in unique_labels:
+                        if label_id > 0:
+                            color = np.array(class_colors.get(label_id, (0, 255, 255)), dtype=np.float32)
+                            color_map[label_map == label_id] = color
+                    
+                    # Overlay merged semantic mask once
+                    if merged_mask.sum() > 0:
+                        pred_overlay = self.draw_instance_mask(pred_overlay, merged_mask, 0, color_map=color_map, alpha=0.7)
             
             # Convert back to uint8
             gt_overlay = gt_overlay.astype(np.uint8)
@@ -334,11 +363,16 @@ class WandbHook(Hook):
             # Convert to RGB for wandb
             merged_image = cv2.cvtColor(merged_image_bgr, cv2.COLOR_BGR2RGB)
             
+            # Get filename from img_data
+            filename = img_data.get('filename', f'image_{i+1}')
+            # Extract just the filename without path
+            filename_short = os.path.basename(filename)
+            
             # Use consistent key across steps for slider feature (wandb will create slider automatically)
-            # Format: val_visualization/img{i+1} - same key for all epochs
+            # Format: val_visualization/{filename} - same key for all epochs
             # Wandb will show a slider when you log the same key across different steps
             self.wandb.log({
-                f'val_visualization/img{i+1}': self.wandb.Image(merged_image, caption=f'Epoch {epoch} - Image {i+1}'),
+                f'val_visualization/{filename_short}': self.wandb.Image(merged_image, caption=f'Epoch {epoch} - {filename_short}'),
             }, step=runner.iter)
     
     def _get_mask_contours(self, mask: np.ndarray) -> List[np.ndarray]:
@@ -401,3 +435,55 @@ class WandbHook(Hook):
         img = np.clip(img, 0, 255).astype(np.uint8)
         return img
 
+
+
+
+    @staticmethod
+    def draw_instance_mask(image: np.ndarray, mask: np.ndarray, label: int, color: Tuple[int, int, int] = None, alpha: float = 0.3, color_map: np.ndarray = None) -> np.ndarray:
+        """
+        Draw instance mask on image.
+        
+        Args:
+            image: Image array [H, W, 3] (BGR format)
+            mask: Mask array [H, W] (binary or float in [0, 1])
+            label: Label int (not used, kept for compatibility)
+            color: Color tuple (B, G, R) for BGR format (used if color_map is None)
+            alpha: Alpha value for blending
+            color_map: Optional color map array [H, W, 3] for per-pixel colors
+        Returns:
+            Image array [H, W, 3] with mask overlaid
+        """
+        # Convert mask to binary float32
+        if mask.dtype == bool:
+            mask_binary = mask.astype(np.float32)
+        elif mask.max() > 1.0:
+            mask_binary = (mask / 255.0 > 0.5).astype(np.float32)
+        else:
+            mask_binary = (mask > 0.5).astype(np.float32)
+        
+        # Skip if mask is empty
+        if mask_binary.sum() == 0:
+            return image
+        
+        # Convert image to float32 for blending
+        img_float = image.astype(np.float32)
+        
+        # Create color overlay
+        H, W = image.shape[:2]
+        if color_map is not None:
+            # Use per-pixel color map
+            color_overlay = color_map.astype(np.float32)
+        else:
+            # Use single color
+            if color is None:
+                color = (0, 255, 255)  # Default cyan
+            color_overlay = np.full((H, W, 3), color, dtype=np.float32)
+        
+        # Expand mask to 3D: [H, W, 3]
+        mask_3d = np.expand_dims(mask_binary, axis=2)
+        mask_3d = np.broadcast_to(mask_3d, (H, W, 3))
+        
+        # Blend: result = image * (1 - alpha*mask) + color * alpha*mask
+        result = img_float * (1 - alpha * mask_3d) + color_overlay * alpha * mask_3d
+        
+        return result.astype(np.uint8)

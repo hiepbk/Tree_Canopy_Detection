@@ -81,7 +81,7 @@ def build_dataset(cfg, mode='train'):
         ann_file=dataset_cfg['ann_file'],
         img_prefix=dataset_cfg['img_prefix'],
         pipeline=dataset_cfg['pipeline'],
-        test_mode=(mode != 'train'),
+        test_mode=dataset_cfg.get('test_mode', False),
         filter_empty_gt=dataset_cfg.get('filter_empty_gt', True),
     )
     return dataset
@@ -430,8 +430,15 @@ def main():
                 # Get image prefix from config
                 img_prefix = cfg.get('data', {}).get('val', {}).get('img_prefix', '')
                 
+                # Get total number of batches for progress tracking
+                total_batches = len(val_loader)
+                
                 with torch.no_grad():
                     for batch_idx, data in enumerate(val_loader):
+                        # Print progress
+                        if rank == 0:
+                            progress = '>' * (batch_idx + 1) + '-' * (total_batches - batch_idx - 1)
+                            logger.info(f'Validation progress: [{progress}] ({batch_idx + 1}/{total_batches})')
                         # Move data to device
                         img = data['img'].cuda()
                         gt_bboxes = [bbox.cuda() for bbox in data['gt_bboxes']]
@@ -446,15 +453,20 @@ def main():
                             return_loss=False,
                         )
                         
-                        # Evaluate batch (with visualization - loads original images from disk)
-                        # Pass original masks from data loader for accurate evaluation
-                        # ori_gt_masks are masks (tensors) at original size from collate_fn
+                        # Evaluate batch (with visualization)
+                        # Pass original masks and images from data loader
                         if 'ori_gt_masks' not in data:
                             raise ValueError(
                                 "ori_gt_masks not found in data. "
                                 "Check that Collect transform includes ori_gt_masks in keys."
                             )
+                        if 'ori_img' not in data:
+                            raise ValueError(
+                                "ori_img not found in data. "
+                                "Check that Collect transform includes ori_img in keys."
+                            )
                         ori_gt_masks = data['ori_gt_masks']
+                        ori_imgs = data['ori_img']  # List of original images (numpy arrays)
                         val_images = evaluator.evaluate_batch(
                             outputs['pred_logits'],
                             outputs['pred_masks'],
@@ -463,7 +475,8 @@ def main():
                             img_metas,
                             img_prefix=img_prefix,
                             return_images=True,
-                            ori_gt_masks=ori_gt_masks,  # Use original polygons for evaluation
+                            ori_gt_masks=ori_gt_masks,  # Original masks at original size
+                            ori_imgs=ori_imgs,  # Original images from data loader
                         )
                         
                         if val_images:

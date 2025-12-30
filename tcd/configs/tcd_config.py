@@ -134,7 +134,7 @@ train_dataset = dict(
         dict(type='Pad', size_divisor=32),
         dict(type='Polygon2Mask'),
         dict(type='DefaultFormatBundle'),
-        dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels', 'gt_masks', 'img_metas', 'ori_gt_masks']),
+        dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels', 'gt_masks', 'img_metas', 'ori_gt_masks', 'ori_img']),
     ],
     filter_empty_gt=True,
 )
@@ -156,7 +156,7 @@ val_dataset = dict(
         dict(type='Pad', size_divisor=32),
         dict(type='Polygon2Mask'),
         dict(type='DefaultFormatBundle'),
-        dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels', 'gt_masks', 'img_metas', 'ori_gt_masks']),
+        dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels', 'gt_masks', 'img_metas', 'ori_gt_masks', 'ori_img']),
     ],
     test_mode=False,
     filter_empty_gt=False,

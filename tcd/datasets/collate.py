@@ -28,6 +28,7 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     gt_masks_list = []
     img_metas_list = []
     ori_gt_masks_list = []
+    ori_imgs_list = []
     
     for item in batch:
         # Image: already tensor [C, H, W] from DefaultFormatBundle
@@ -60,6 +61,10 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         ori_masks = item['ori_gt_masks']
         ori_masks_tensors = [torch.from_numpy(m).float() for m in ori_masks]
         ori_gt_masks_list.append(ori_masks_tensors)
+        
+        # Original images: keep as numpy arrays (for visualization)
+        ori_img = item['ori_img']  # numpy array [H, W, C] RGB
+        ori_imgs_list.append(ori_img)
     
     # Stack images: [B, C, H, W]
     imgs = torch.stack(imgs, dim=0)
@@ -71,5 +76,6 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         'gt_masks': gt_masks_list,
         'img_metas': img_metas_list,
         'ori_gt_masks': ori_gt_masks_list,
+        'ori_img': ori_imgs_list,
     }
 

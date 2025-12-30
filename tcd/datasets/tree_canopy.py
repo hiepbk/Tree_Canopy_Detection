@@ -117,6 +117,7 @@ class TreeCanopyDataset(Dataset):
             'img': img,
             'img_shape': img.shape[:2],
             'ori_shape': img.shape[:2],
+            'ori_img': img.copy(),  # Store original image for evaluation/visualization
         }
         
         # Prepare img_metas with all available metadata
