@@ -186,62 +186,156 @@ class WandbHook(Hook):
             val_images: List of dicts with 'image', 'pred_masks', 'gt_masks', 'pred_labels', 'gt_labels'
             epoch: Current epoch number
         """
-        # Color mapping
+        import cv2
+        
+        # Color mapping (BGR for OpenCV)
         class_colors = {
-            1: np.array([0, 255, 0]),      # Green for individual_tree
-            2: np.array([255, 0, 0]),      # Red for group_of_trees
+            1: (0, 255, 0),      # Green for individual_tree
+            2: (0, 0, 255),      # Red for group_of_trees
         }
         
         for i, img_data in enumerate(val_images[:self.num_eval_images]):
-            image = img_data['image']  # [H, W, 3] numpy array
+            image = img_data['image']  # [H, W, 3] numpy array (RGB)
             pred_masks = img_data.get('pred_masks', [])
             gt_masks = img_data.get('gt_masks', [])
             pred_labels = img_data.get('pred_labels', [])
             gt_labels = img_data.get('gt_labels', [])
             
-            # Overlay GT masks on image
-            gt_overlay = image.copy()
+            # Debug: ensure masks are lists and handle different formats
+            if not isinstance(gt_masks, list):
+                if isinstance(gt_masks, np.ndarray):
+                    if gt_masks.ndim == 3:
+                        gt_masks = [gt_masks[j] for j in range(gt_masks.shape[0])]
+                    elif gt_masks.ndim == 2:
+                        gt_masks = [gt_masks]
+                    else:
+                        gt_masks = []
+                elif isinstance(gt_masks, torch.Tensor):
+                    gt_masks_np = gt_masks.cpu().numpy()
+                    if gt_masks_np.ndim == 3:
+                        gt_masks = [gt_masks_np[j] for j in range(gt_masks_np.shape[0])]
+                    elif gt_masks_np.ndim == 2:
+                        gt_masks = [gt_masks_np]
+                    else:
+                        gt_masks = []
+                else:
+                    gt_masks = []
+            
+            if not isinstance(pred_masks, list):
+                if isinstance(pred_masks, np.ndarray):
+                    if pred_masks.ndim == 3:
+                        pred_masks = [pred_masks[j] for j in range(pred_masks.shape[0])]
+                    elif pred_masks.ndim == 2:
+                        pred_masks = [pred_masks]
+                    else:
+                        pred_masks = []
+                elif isinstance(pred_masks, torch.Tensor):
+                    pred_masks_np = pred_masks.cpu().numpy()
+                    if pred_masks_np.ndim == 3:
+                        pred_masks = [pred_masks_np[j] for j in range(pred_masks_np.shape[0])]
+                    elif pred_masks_np.ndim == 2:
+                        pred_masks = [pred_masks_np]
+                    else:
+                        pred_masks = []
+                else:
+                    pred_masks = []
+            
+            # Ensure labels match masks length
+            if len(gt_labels) != len(gt_masks):
+                gt_labels = gt_labels[:len(gt_masks)] if len(gt_labels) > len(gt_masks) else gt_labels + [1] * (len(gt_masks) - len(gt_labels))
+            if len(pred_labels) != len(pred_masks):
+                pred_labels = pred_labels[:len(pred_masks)] if len(pred_labels) > len(pred_masks) else pred_labels + [1] * (len(pred_masks) - len(pred_labels))
+            
+            # Convert RGB to BGR for OpenCV
+            image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            
+            # Overlay GT masks on image using OpenCV
+            gt_overlay = image_bgr.copy()
             for mask, label in zip(gt_masks, gt_labels):
                 if isinstance(mask, torch.Tensor):
                     mask = mask.cpu().numpy()
-                # Convert mask to binary [H, W]
+                
+                # Ensure mask is 2D [H, W]
+                if mask.ndim > 2:
+                    mask = mask.squeeze()
+                
+                # Ensure mask matches image dimensions
+                if mask.shape[:2] != gt_overlay.shape[:2]:
+                    mask = cv2.resize(mask, (gt_overlay.shape[1], gt_overlay.shape[0]), interpolation=cv2.INTER_NEAREST)
+                
+                # Convert mask to binary [H, W] float32 for blending
                 if mask.max() <= 1.0:
                     mask_binary = (mask > 0.5).astype(np.float32)
                 else:
                     mask_binary = (mask > 127).astype(np.float32)
                 
-                color = class_colors.get(int(label), np.array([255, 255, 0]))
-                # Overlay mask: image = image * (1 - alpha) + color * alpha where mask is 1
-                alpha = 0.4
-                for c in range(3):
-                    gt_overlay[:, :, c] = gt_overlay[:, :, c] * (1 - mask_binary * alpha) + color[c] * mask_binary * alpha
+                # Skip if mask is empty
+                if mask_binary.sum() == 0:
+                    continue
+                
+                color = class_colors.get(int(label), (0, 255, 255))
+                # Create colored overlay
+                color_overlay = np.zeros_like(gt_overlay, dtype=np.float32)
+                color_overlay[:, :] = color
+                
+                # Blend: result = image * (1 - alpha*mask) + color * alpha*mask
+                alpha = 0.25  # More transparent
+                mask_3d = np.stack([mask_binary] * 3, axis=2)
+                gt_overlay = (gt_overlay.astype(np.float32) * (1 - alpha * mask_3d) + 
+                             color_overlay * alpha * mask_3d).astype(np.uint8)
             
-            # Overlay predicted masks on image
-            pred_overlay = image.copy()
+            # Overlay predicted masks on image using OpenCV
+            pred_overlay = image_bgr.copy()
             for mask, label in zip(pred_masks, pred_labels):
                 if isinstance(mask, torch.Tensor):
                     mask = mask.cpu().numpy()
-                # Convert mask to binary [H, W]
+                
+                # Ensure mask is 2D [H, W]
+                if mask.ndim > 2:
+                    mask = mask.squeeze()
+                
+                # Ensure mask matches image dimensions
+                if mask.shape[:2] != pred_overlay.shape[:2]:
+                    mask = cv2.resize(mask, (pred_overlay.shape[1], pred_overlay.shape[0]), interpolation=cv2.INTER_NEAREST)
+                
+                # Convert mask to binary [H, W] float32 for blending
                 if mask.max() <= 1.0:
                     mask_binary = (mask > 0.5).astype(np.float32)
                 else:
                     mask_binary = (mask > 127).astype(np.float32)
                 
-                color = class_colors.get(int(label), np.array([255, 255, 0]))
-                # Overlay mask: image = image * (1 - alpha) + color * alpha where mask is 1
-                alpha = 0.4
-                for c in range(3):
-                    pred_overlay[:, :, c] = pred_overlay[:, :, c] * (1 - mask_binary * alpha) + color[c] * mask_binary * alpha
+                # Skip if mask is empty
+                if mask_binary.sum() == 0:
+                    continue
+                
+                color = class_colors.get(int(label), (0, 255, 255))
+                # Create colored overlay
+                color_overlay = np.zeros_like(pred_overlay, dtype=np.float32)
+                color_overlay[:, :] = color
+                
+                # Blend: result = image * (1 - alpha*mask) + color * alpha*mask
+                alpha = 0.25  # More transparent
+                mask_3d = np.stack([mask_binary] * 3, axis=2)
+                pred_overlay = (pred_overlay.astype(np.float32) * (1 - alpha * mask_3d) + 
+                               color_overlay * alpha * mask_3d).astype(np.uint8)
             
-            # Convert to uint8
-            gt_overlay = np.clip(gt_overlay, 0, 255).astype(np.uint8)
-            pred_overlay = np.clip(pred_overlay, 0, 255).astype(np.uint8)
+            # Add text labels to BGR images before merging
+            cv2.putText(gt_overlay, 'Ground Truth', (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(pred_overlay, 'Predictions', (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
             
-            # Log each image separately to val_visualization group (creates separate tab)
-            # Each image will be displayed as equal size like charts
+            # Merge GT and predictions side by side (still in BGR)
+            merged_image_bgr = np.hstack([gt_overlay, pred_overlay])
+            
+            # Convert to RGB for wandb
+            merged_image = cv2.cvtColor(merged_image_bgr, cv2.COLOR_BGR2RGB)
+            
+            # Use consistent key across steps for slider feature (wandb will create slider automatically)
+            # Format: val_visualization/img{i+1} - same key for all epochs
+            # Wandb will show a slider when you log the same key across different steps
             self.wandb.log({
-                f'val_visualization/gt_epoch{epoch}_img{i+1}': self.wandb.Image(gt_overlay, caption=f'Ground Truth - Epoch {epoch}, Image {i+1}'),
-                f'val_visualization/pred_epoch{epoch}_img{i+1}': self.wandb.Image(pred_overlay, caption=f'Predictions - Epoch {epoch}, Image {i+1}'),
+                f'val_visualization/img{i+1}': self.wandb.Image(merged_image, caption=f'Epoch {epoch} - Image {i+1}'),
             }, step=runner.iter)
     
     def _get_mask_contours(self, mask: np.ndarray) -> List[np.ndarray]:
