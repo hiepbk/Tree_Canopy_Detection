@@ -202,7 +202,7 @@ checkpoint_config = dict(interval=5, save_last=True, max_keep_ckpts=3)
 
 # Logging configuration
 log_config = dict(
-    interval=10,
+    interval=2,
     hooks=[
         'TextLoggerHook',
         'WandbHook',
@@ -218,7 +218,7 @@ log_config = dict(
 
 # Evaluation configuration
 evaluation = dict(
-    interval=10,
+    interval=5,
     metric=['segm'],
     save_best='segm_mAP',
     rule='greater',
