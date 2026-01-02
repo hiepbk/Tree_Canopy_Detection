@@ -28,7 +28,7 @@ model = dict(
         out_channels=256,
         num_things_classes=2,  # individual_tree, group_of_trees
         num_stuff_classes=0,
-        num_queries=100,
+        num_queries=100,  # Reduced back to 100 - 300 didn't help convergence
         num_transformer_feat_level=3,
         align_corners=False,
         pixel_decoder=dict(
@@ -84,7 +84,9 @@ model = dict(
         ),
     ),
     train_cfg=dict(
-        num_points=3136,  # Reduced from 12544 to save VRAM (4x reduction)
+        # num_points=12544,  # Original - causes OOM
+        # num_points=3136,  # Too low - poor matching quality
+        num_points=6000,  # Balanced: ~2x of 3136, better matching while avoiding OOM
         oversample_ratio=3.0,
         importance_sample_ratio=0.75,
         assigner=dict(
@@ -237,20 +239,20 @@ log_config = dict(
     interval=10,
     hooks=[
         'TextLoggerHook',
-        'WandbHook',
+        # 'WandbHook',
     ],
-    wandb=dict(
-        init_kwargs=dict(
-            project='tree_canopy_detection',
-            name='tcd_exp1',
-        ),
-        num_eval_images=5,
-    ),
+    # wandb=dict(
+    #     init_kwargs=dict(
+    #         project='tree_canopy_detection',
+    #         name='tcd_exp1',
+    #     ),
+    #     num_eval_images=5,
+    # ),
 )
 
 # Evaluation configuration
 evaluation = dict(
-    interval=5,
+    interval=10,
     metric=['segm'],
     save_best='segm_mAP',
     rule='greater',
