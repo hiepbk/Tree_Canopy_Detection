@@ -82,9 +82,79 @@ class DiceLoss(nn.Module):
             return loss
 
 
-class HungarianMatcher(nn.Module):
+def point_sample(input, point_coords, **kwargs):
+    """Sample points from input tensor using bilinear interpolation.
+    
+    A wrapper around torch.nn.functional.grid_sample to support 3D point_coords tensors.
+    Unlike grid_sample it assumes point_coords to lie inside [0, 1] x [0, 1] square.
+    
+    Args:
+        input: [N, C, H, W] tensor
+        point_coords: [N, P, 2] tensor with normalized coordinates in [0, 1]
+        **kwargs: Additional arguments for grid_sample (e.g., align_corners)
+    
+    Returns:
+        [N, C, P] tensor with sampled values
     """
-    Hungarian Matcher for bipartite matching.
+    add_dim = False
+    if point_coords.dim() == 3:
+        add_dim = True
+        point_coords = point_coords.unsqueeze(2)
+    # Convert from [0, 1] to [-1, 1] for grid_sample
+    output = F.grid_sample(input, 2.0 * point_coords - 1.0, **kwargs)
+    if add_dim:
+        output = output.squeeze(3)
+    return output
+
+
+def batch_dice_loss(inputs: torch.Tensor, targets: torch.Tensor):
+    """Compute the DICE loss between predictions and targets.
+    
+    Args:
+        inputs: [num_queries, num_points] - predicted mask logits
+        targets: [num_targets, num_points] - target mask values
+    
+    Returns:
+        [num_queries, num_targets] cost matrix
+    """
+    inputs = inputs.sigmoid()
+    inputs = inputs.flatten(1)
+    numerator = 2 * torch.einsum("nc,mc->nm", inputs, targets)
+    denominator = inputs.sum(-1)[:, None] + targets.sum(-1)[None, :]
+    loss = 1 - (numerator + 1) / (denominator + 1)
+    return loss
+
+
+def batch_sigmoid_ce_loss(inputs: torch.Tensor, targets: torch.Tensor):
+    """Compute sigmoid cross-entropy loss between predictions and targets.
+    
+    Args:
+        inputs: [num_queries, num_points] - predicted mask logits
+        targets: [num_targets, num_points] - target mask values
+    
+    Returns:
+        [num_queries, num_targets] cost matrix
+    """
+    hw = inputs.shape[1]
+    
+    pos = F.binary_cross_entropy_with_logits(
+        inputs, torch.ones_like(inputs), reduction="none"
+    )
+    neg = F.binary_cross_entropy_with_logits(
+        inputs, torch.zeros_like(inputs), reduction="none"
+    )
+    
+    loss = torch.einsum("nc,mc->nm", pos, targets) + torch.einsum(
+        "nc,mc->nm", neg, (1 - targets)
+    )
+    
+    return loss / hw
+
+
+class HungarianMatcher(nn.Module):
+    """Hungarian Matcher for bipartite matching.
+    
+    This is the standard implementation from YOSO/DETR/Mask2Former.
     
     Args:
         cost_class: Weight for classification cost
@@ -98,13 +168,15 @@ class HungarianMatcher(nn.Module):
         cost_class: float = 2.0,
         cost_mask: float = 5.0,
         cost_dice: float = 5.0,
-        num_points: int = 12544,
+        num_points: int = 6000,
     ):
         super(HungarianMatcher, self).__init__()
         self.cost_class = cost_class
         self.cost_mask = cost_mask
         self.cost_dice = cost_dice
         self.num_points = num_points
+        
+        assert cost_class != 0 or cost_mask != 0 or cost_dice != 0, "all costs cant be 0"
     
     @torch.no_grad()
     def forward(
@@ -112,7 +184,7 @@ class HungarianMatcher(nn.Module):
         outputs: Dict[str, torch.Tensor],
         targets: List[Dict[str, torch.Tensor]],
     ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-        """Forward function.
+        """Forward function - standard YOSO/DETR implementation.
         
         Args:
             outputs: Dict with 'pred_logits' and 'pred_masks'
@@ -121,124 +193,112 @@ class HungarianMatcher(nn.Module):
         Returns:
             List of (pred_idx, target_idx) pairs
         """
-        bs, num_queries = outputs['pred_logits'].shape[:2]
+        bs, num_queries = outputs['pred_masks'].shape[:2]
         
-        # Compute cost for each batch
         indices = []
+        
+        # Iterate through batch size
         for b in range(bs):
-            out_prob = outputs['pred_logits'][b].softmax(-1)  # [num_queries, num_classes]
-            out_mask = outputs['pred_masks'][b]  # [num_queries, H, W]
-            
-            tgt_ids = targets[b]['labels']  # [num_targets]
-            tgt_mask = targets[b]['masks']  # [num_targets, H, W]
+            tgt_ids = targets[b]['labels']
             
             # Classification cost
-            alpha = 0.25
-            gamma = 2.0
-            neg_cost_class = (1 - alpha) * (out_prob ** gamma) * (-(1 - out_prob + 1e-8).log())
-            pos_cost_class = alpha * ((1 - out_prob) ** gamma) * (-(out_prob + 1e-8).log())
-            cost_class = pos_cost_class[:, tgt_ids] - neg_cost_class[:, tgt_ids]
+            if outputs['pred_logits'] is None:
+                cost_class = 0.0
+            else:
+                out_prob = outputs['pred_logits'][b].softmax(-1)  # [num_queries, num_classes]
+                
+                if torch.isnan(out_prob).any() or torch.isinf(out_prob).any():
+                    raise ValueError("out_prob contains NaN/Inf")
+                
+                # Compute the classification cost. Contrary to the loss, we don't use the NLL,
+                # but approximate it in 1 - proba[target class].
+                cost_class = -out_prob[:, tgt_ids]  # [num_queries, num_targets]
+                
+                if torch.isnan(cost_class).any() or torch.isinf(cost_class).any():
+                    raise ValueError("cost_class contains NaN/Inf")
             
             # Mask cost
-            # out_mask: [num_queries, H, W]
-            # tgt_mask: [num_targets, H, W]
+            out_mask = outputs['pred_masks'][b]  # [num_queries, H_pred, W_pred]
+            tgt_mask = targets[b]['masks'].to(out_mask)  # [num_targets, H_gt, W_gt]
             
-            # Flatten masks
-            out_mask_flat = out_mask.flatten(1)  # [num_queries, H*W]
-            tgt_mask_flat = tgt_mask.flatten(1)  # [num_targets, H*W]
+            if torch.isnan(out_mask).any() or torch.isinf(out_mask).any():
+                raise ValueError("out_mask contains NaN/Inf")
             
-            # Sample points from target masks
-            with torch.no_grad():
-                points = torch.multinomial(tgt_mask_flat + 1e-8, self.num_points, replacement=True)  # [num_targets, num_points]
+            if torch.isnan(tgt_mask).any() or torch.isinf(tgt_mask).any():
+                raise ValueError("tgt_mask contains NaN/Inf")
             
-            # Sample from out_mask for each query-target pair
-            # out_mask_flat: [num_queries, H*W]
-            # points: [num_targets, num_points]
-            # We need: [num_queries, num_targets, num_points]
-            num_queries = out_mask_flat.shape[0]
-            num_targets = points.shape[0]
-            num_points = points.shape[1]
+            # Prepare masks for point sampling: add channel dimension
+            out_mask = out_mask[:, None]  # [num_queries, 1, H, W]
+            tgt_mask = tgt_mask[:, None]  # [num_targets, 1, H, W]
             
-            # Memory-efficient sampling using expand (doesn't copy, just creates view)
-            # Expand points: [1, num_targets, num_points] -> [num_queries, num_targets, num_points]
-            points_expanded = points.unsqueeze(0).expand(num_queries, -1, -1)  # [num_queries, num_targets, num_points]
+            # All masks share the same set of points for efficient matching!
+            point_coords = torch.rand(1, self.num_points, 2, device=out_mask.device)  # [1, num_points, 2] in [0, 1]
             
-            # Gather sampled points: need to expand out_mask_flat to match dimensions
-            # out_mask_flat: [num_queries, H*W]
-            # Expand to: [num_queries, num_targets, H*W] (view, no copy)
-            out_mask_expanded = out_mask_flat.unsqueeze(1).expand(-1, num_targets, -1)  # [num_queries, num_targets, H*W]
-            # Now gather: [num_queries, num_targets, num_points]
-            out_mask_sampled = out_mask_expanded.gather(2, points_expanded)  # [num_queries, num_targets, num_points]
+            # Sample from target masks
+            tgt_mask_sampled = point_sample(
+                tgt_mask,
+                point_coords.repeat(tgt_mask.shape[0], 1, 1),
+                align_corners=False,
+            ).squeeze(1)  # [num_targets, num_points]
             
-            # Sample from tgt_mask: [num_targets, num_points]
-            tgt_mask_sampled = tgt_mask_flat.gather(1, points)  # [num_targets, num_points]
-            # Expand to match: [1, num_targets, num_points] -> [num_queries, num_targets, num_points]
-            tgt_mask_sampled = tgt_mask_sampled.unsqueeze(0).expand(num_queries, -1, -1)  # [num_queries, num_targets, num_points]
+            # Sample from predicted masks
+            out_mask_sampled = point_sample(
+                out_mask,
+                point_coords.repeat(out_mask.shape[0], 1, 1),
+                align_corners=False,
+            ).squeeze(1)  # [num_queries, num_points]
             
-            out_mask_sampled = out_mask_sampled.sigmoid()
-            tgt_mask_sampled = tgt_mask_sampled.float()
+            if torch.isnan(out_mask_sampled).any() or torch.isinf(out_mask_sampled).any():
+                raise ValueError("out_mask_sampled contains NaN/Inf")
             
-            # Dice cost: [num_queries, num_targets]
-            cost_dice = self._dice_cost(out_mask_sampled, tgt_mask_sampled)  # [num_queries, num_targets]
+            if torch.isnan(tgt_mask_sampled).any() or torch.isinf(tgt_mask_sampled).any():
+                raise ValueError("tgt_mask_sampled contains NaN/Inf")
             
-            # Mask cost (binary cross entropy): [num_queries, num_targets]
-            cost_mask = F.binary_cross_entropy_with_logits(
-                out_mask_sampled,
-                tgt_mask_sampled,
-                reduction='none',
-            ).mean(-1)  # [num_queries, num_targets]
+            # Compute costs
+            with torch.cuda.amp.autocast(enabled=False):
+                out_mask_sampled = out_mask_sampled.float()
+                tgt_mask_sampled = tgt_mask_sampled.float()
+                
+                # Compute the focal loss between masks
+                cost_mask = batch_sigmoid_ce_loss(out_mask_sampled, tgt_mask_sampled)  # [num_queries, num_targets]
+                
+                if torch.isnan(cost_mask).any() or torch.isinf(cost_mask).any():
+                    raise ValueError("cost_mask contains NaN/Inf")
+                
+                # Compute the dice loss between masks
+                cost_dice = batch_dice_loss(out_mask_sampled, tgt_mask_sampled)  # [num_queries, num_targets]
+                
+                if torch.isnan(cost_dice).any() or torch.isinf(cost_dice).any():
+                    raise ValueError("cost_dice contains NaN/Inf")
             
             # Final cost matrix
-            C = self.cost_mask * cost_mask + self.cost_class * cost_class + self.cost_dice * cost_dice
-            C = C.cpu()
+            if isinstance(cost_class, float):
+                C = self.cost_mask * cost_mask + self.cost_dice * cost_dice
+            else:
+                C = (
+                    self.cost_mask * cost_mask
+                    + self.cost_class * cost_class
+                    + self.cost_dice * cost_dice
+                )
+            
+            if torch.isnan(C).any() or torch.isinf(C).any():
+                raise ValueError("Cost matrix contains NaN/Inf values")
+            
+            C = C.reshape(num_queries, -1).cpu()
+            
+            # Ensure C is finite before passing to scipy
+            C_np = C.numpy()
+            if not np.isfinite(C_np).all():
+                # Replace any remaining invalid values
+                C_np[~np.isfinite(C_np)] = 1e6
             
             # Hungarian algorithm
-            indices.append(self._linear_sum_assignment(C))
+            from scipy.optimize import linear_sum_assignment
+            row_ind, col_ind = linear_sum_assignment(C_np)
+            indices.append((torch.as_tensor(row_ind, dtype=torch.int64), 
+                          torch.as_tensor(col_ind, dtype=torch.int64)))
         
         return indices
-    
-    def _dice_cost(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Compute dice cost.
-        
-        Args:
-            pred: [num_queries, num_targets, num_points] or [..., num_points]
-            target: [num_queries, num_targets, num_points] or [..., num_points]
-            
-        Returns:
-            Dice cost: [num_queries, num_targets] or [...]
-        """
-        # Sum over the last dimension (num_points)
-        intersection = (pred * target).sum(-1)  # [num_queries, num_targets]
-        union = pred.sum(-1) + target.sum(-1)  # [num_queries, num_targets]
-        dice = (2.0 * intersection + 1e-5) / (union + 1e-5)
-        return 1 - dice
-    
-    def _linear_sum_assignment(self, cost: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Linear sum assignment (Hungarian algorithm).
-        
-        Simplified version - in practice, use scipy.optimize.linear_sum_assignment
-        """
-        try:
-            from scipy.optimize import linear_sum_assignment
-            row_ind, col_ind = linear_sum_assignment(cost.numpy())
-            return (torch.from_numpy(row_ind), torch.from_numpy(col_ind))
-        except ImportError:
-            # Fallback: greedy matching
-            row_ind = []
-            col_ind = []
-            cost_np = cost.numpy()
-            used_cols = set()
-            for i in range(cost_np.shape[0]):
-                valid_cols = [j for j in range(cost_np.shape[1]) if j not in used_cols]
-                if valid_cols:
-                    j = valid_cols[np.argmin(cost_np[i, valid_cols])]
-                    row_ind.append(i)
-                    col_ind.append(j)
-                    used_cols.add(j)
-                else:
-                    row_ind.append(i)
-                    col_ind.append(0)
-            return (torch.tensor(row_ind), torch.tensor(col_ind))
 
 
 @HEAD.register_module()

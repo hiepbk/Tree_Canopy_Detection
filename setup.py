@@ -2,8 +2,12 @@
 Setup script for Tree Canopy Detection (TCD) package.
 """
 
-from setuptools import setup, find_packages
+import glob
 import os
+from pathlib import Path
+from setuptools import setup, find_packages, Extension
+from torch.utils.cpp_extension import CUDA_HOME, CppExtension, CUDAExtension
+import torch
 
 # Read README for long description
 def read_readme():
@@ -26,6 +30,48 @@ def read_requirements():
                     requirements.append(line)
             return requirements
     return []
+
+
+def get_extensions():
+    """Get C++/CUDA extensions for deformable convolution."""
+    this_dir = Path(__file__).parent
+    extensions_dir = this_dir / "tcd" / "layers" / "csrc"
+    
+    main_source = str(extensions_dir / "vision.cpp")
+    sources = [str(main_source)]
+    
+    extension = CppExtension
+    extra_compile_args = {"cxx": ["-O3"]}
+    define_macros = []
+    
+    # Add CUDA sources if available
+    if torch.cuda.is_available() and CUDA_HOME is not None:
+        source_cuda = glob.glob(str(extensions_dir / "deformable" / "*.cu"))
+        sources += source_cuda
+        extension = CUDAExtension
+        define_macros += [("WITH_CUDA", None)]
+        extra_compile_args["nvcc"] = [
+            "-O3",
+            "-DCUDA_HAS_FP16=1",
+            "-D__CUDA_NO_HALF_OPERATORS__",
+            "-D__CUDA_NO_HALF_CONVERSIONS__",
+            "-D__CUDA_NO_HALF2_OPERATORS__",
+        ]
+    
+    include_dirs = [str(extensions_dir)]
+    
+    ext_modules = [
+        extension(
+            "tcd._C",
+            sources,
+            include_dirs=include_dirs,
+            define_macros=define_macros,
+            extra_compile_args=extra_compile_args,
+        )
+    ]
+    
+    return ext_modules
+
 
 setup(
     name='tcd',
@@ -60,5 +106,7 @@ setup(
     ],
     keywords='tree canopy detection, instance segmentation, remote sensing, computer vision',
     zip_safe=False,
+    ext_modules=get_extensions(),
+    cmdclass={"build_ext": torch.utils.cpp_extension.BuildExtension},
 )
 

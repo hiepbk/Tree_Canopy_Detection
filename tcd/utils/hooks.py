@@ -71,12 +71,20 @@ class TextLoggerHook(Hook):
     
     def after_train_iter(self, runner, batch_idx, data, outputs):
         if runner.rank == 0 and batch_idx % self.interval == 0:
+            total_batches = getattr(runner, 'total_batches', None)
+            if total_batches is not None:
+                # Format: Epoch(train)  [1][700/946]
+                epoch_str = f'Epoch(train)  [{runner.epoch}][{batch_idx + 1}/{total_batches}]'
+            else:
+                # Fallback to old format if total_batches not available
+                epoch_str = f'Epoch {runner.epoch}, Batch {batch_idx}'
+            
             if isinstance(outputs, dict):
                 loss_str = ', '.join([f'{k}: {v.item():.4f}' for k, v in outputs.items()])
                 total_loss = sum(outputs.values()).item()
-                print(f'Epoch {runner.epoch}, Batch {batch_idx}, Total Loss: {total_loss:.4f} ({loss_str})')
+                print(f'{epoch_str}, Total Loss: {total_loss:.4f} ({loss_str})')
             else:
-                print(f'Epoch {runner.epoch}, Batch {batch_idx}, Loss: {outputs.item():.4f}')
+                print(f'{epoch_str}, Loss: {outputs.item():.4f}')
     
     def before_val_epoch(self, runner):
         if runner.rank == 0:

@@ -39,6 +39,8 @@ def parse_args():
     parser.add_argument('--gpus', type=int, default=1, help='Number of GPUs')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--deterministic', action='store_true', help='Use deterministic algorithms')
+    # For distributed training with torch.distributed.launch
+    parser.add_argument('--local-rank', type=int, default=0, help='Local rank for distributed training')
     return parser.parse_args()
 
 
@@ -166,9 +168,8 @@ def train_epoch(runner, dataloader, cfg, distributed=False):
     total_loss = 0.0
     num_batches = 0
     
-    # Mixed precision training (FP16) - saves ~50% VRAM
-    use_amp = cfg.get('optimizer_config', {}).get('type') == 'AmpOptimizerHook'
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    # Store total batches for progress logging
+    runner.total_batches = len(dataloader)
     
     # Gradient accumulation
     accumulation_steps = cfg.get('runner', {}).get('gradient_accumulation_steps', 1)
@@ -194,24 +195,14 @@ def train_epoch(runner, dataloader, cfg, distributed=False):
         gt_masks = [mask.cuda() for mask in data['gt_masks']]
         img_metas = data['img_metas']
         
-        # Forward with mixed precision
-        if use_amp:
-            with torch.cuda.amp.autocast():
-                losses = runner.model(
-                    img=img,
-                    img_metas=img_metas,
-                    gt_bboxes=gt_bboxes,
-                    gt_labels=gt_labels,
-                    gt_masks=gt_masks,
-                )
-        else:
-            losses = runner.model(
-                img=img,
-                img_metas=img_metas,
-                gt_bboxes=gt_bboxes,
-                gt_labels=gt_labels,
-                gt_masks=gt_masks,
-            )
+        # Forward pass (no mixed precision - original YOSO uses float32)
+        losses = runner.model(
+            img=img,
+            img_metas=img_metas,
+            gt_bboxes=gt_bboxes,
+            gt_labels=gt_labels,
+            gt_masks=gt_masks,
+        )
         
         # Compute total loss
         if isinstance(losses, dict):
@@ -222,30 +213,20 @@ def train_epoch(runner, dataloader, cfg, distributed=False):
         # Scale loss for gradient accumulation
         loss = loss / accumulation_steps
         
-        # Backward with mixed precision
-        if use_amp:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
+        # Backward pass (no mixed precision - original YOSO uses float32)
+        loss.backward()
         
         # Update weights only after accumulating gradients
         if (batch_idx + 1) % accumulation_steps == 0:
             # Gradient clipping
             if 'optimizer_config' in cfg and 'grad_clip' in cfg['optimizer_config']:
-                if use_amp:
-                    scaler.unscale_(runner.optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     runner.model.parameters(),
                     **cfg['optimizer_config']['grad_clip'],
                 )
             
             # Optimizer step
-            if use_amp:
-                scaler.step(runner.optimizer)
-                scaler.update()
-            else:
-                runner.optimizer.step()
-            
+            runner.optimizer.step()
             runner.optimizer.zero_grad()
             
             # Clear cache periodically
@@ -291,12 +272,13 @@ def main():
     set_random_seed(cfg.get('seed', 42), cfg.get('deterministic', False))
     
     # Setup distributed training
-    # Check if running in distributed mode (torchrun sets these env vars)
+    # Check if running in distributed mode (torchrun/torch.distributed.launch sets these)
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        # torchrun automatically sets up distributed
+        # torchrun/torch.distributed.launch automatically sets up distributed
         distributed = True
         rank = int(os.environ['RANK'])
-        local_rank = int(os.environ.get('LOCAL_RANK', rank))
+        # Prefer command-line arg, then env var, then fallback to rank
+        local_rank = args.local_rank if args.local_rank is not None else int(os.environ.get('LOCAL_RANK', rank))
         world_size = int(os.environ['WORLD_SIZE'])
         
         # Initialize process group if not already initialized
@@ -309,7 +291,7 @@ def main():
         distributed = True
         dist.init_process_group(backend='nccl')
         rank = dist.get_rank()
-        local_rank = int(os.environ.get('LOCAL_RANK', rank))
+        local_rank = args.local_rank if args.local_rank is not None else int(os.environ.get('LOCAL_RANK', rank))
         torch.cuda.set_device(local_rank)
     else:
         distributed = False
@@ -344,7 +326,7 @@ def main():
     if distributed:
         if rank == 0:
             logger.info('Wrapping model with DDP...')
-        model = DDP(model, device_ids=[rank])
+        model = DDP(model, device_ids=[local_rank])
     
     if rank == 0:
         logger.info('Building datasets...')

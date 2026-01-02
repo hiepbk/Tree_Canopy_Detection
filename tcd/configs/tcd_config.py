@@ -14,74 +14,42 @@ model = dict(
         frozen_stages=2,
     ),
     neck=dict(
-        type='FPN',
-        in_channels=[128, 256, 512, 1024],  # For Swin-B
-        out_channels=256,
-        num_outs=4,
-        start_level=0,
-        add_extra_convs='on_input',
+        type='YOSONeck',
+        in_channels=[128, 256, 512, 1024],  # For Swin-B: [stage2, stage3, stage4, stage5]
+        # For Swin-T use: [96, 192, 384, 768]
+        agg_dim=128,  # Aggregated feature dimension
+        hidden_dim=256,  # Hidden dimension for output
+        norm='BN',  # 'BN' for single GPU, 'SyncBN' for multi-GPU
     ),
     head=dict(
-        type='Mask2FormerHead',
-        in_channels=[256, 256, 256, 256],  # FPN output channels
-        feat_channels=256,
-        out_channels=256,
+        type='YOSOHead',
+        in_channels=256,  # YOSO neck outputs single feature map with hidden_dim channels
+        hidden_dim=256,
         num_things_classes=2,  # individual_tree, group_of_trees
-        num_stuff_classes=0,
-        num_queries=100,  # Reduced back to 100 - 300 didn't help convergence
-        num_transformer_feat_level=3,
-        align_corners=False,
-        pixel_decoder=dict(
-            type='PixelDecoder',
-            in_channels=[256, 256, 256, 256],
-            feat_channels=256,
-            out_channels=256,
-            num_outs=3,
-            norm_cfg=dict(type='GN', num_groups=32),
-            act_cfg=dict(type='ReLU'),
-        ),
-        transformer_decoder=dict(
-            type='DetrTransformerDecoder',
-            return_intermediate=True,
-            num_layers=6,
-            transformerlayers=dict(
-                type='DetrTransformerDecoderLayer',
-                attn_cfgs=dict(
-                    type='MultiheadAttention',
-                    embed_dims=256,
-                    num_heads=8,
-                    dropout=0.1,
-                ),
-                ffn_cfgs=dict(
-                    type='FFN',
-                    embed_dims=256,
-                    feedforward_channels=2048,
-                    num_fcs=2,
-                    ffn_drop=0.1,
-                    act_cfg=dict(type='ReLU', inplace=True),
-                ),
-                operation_order=('self_attn', 'norm', 'cross_attn', 'norm', 'ffn', 'norm'),
-            ),
-        ),
+        num_proposals=100,  # Number of proposal kernels (equivalent to num_queries)
+        num_stages=3,  # Number of refinement stages
+        conv_kernel_size_2d=1,  # 2D convolution kernel size for proposal kernels (must be 1 to match original YOSO)
+        conv_kernel_size_1d=3,  # 1D convolution kernel size for attention
+        temperature=0.1,  # Temperature for logits scaling
+        num_cls_fcs=2,  # Number of classification FC layers
+        num_mask_fcs=2,  # Number of mask FC layers
+        feedforward_channels=2048,  # FFN hidden dimension
         loss_cls=dict(
             type='FocalLoss',
-            use_sigmoid=True,
-            gamma=2.0,
             alpha=0.25,
-            loss_weight=2.0,
+            gamma=2.0,
         ),
         loss_mask=dict(
             type='DiceLoss',
             use_sigmoid=True,
-            activate=True,
-            loss_weight=5.0,
+            activate=False,
         ),
         loss_dice=dict(
             type='DiceLoss',
             use_sigmoid=True,
             activate=False,
-            loss_weight=5.0,
         ),
+        num_points=6000,  # Number of points for mask loss computation
     ),
     train_cfg=dict(
         # num_points=12544,  # Original - causes OOM
@@ -208,9 +176,7 @@ optimizer = dict(
 
 optimizer_config = dict(
     grad_clip=dict(max_norm=0.1, norm_type=2),
-    # Mixed precision training (FP16) - saves ~50% VRAM
-    type='AmpOptimizerHook',
-    loss_scale='dynamic',
+    # No mixed precision - use FP32 like original YOSO
 )
 
 # Learning rate schedule
@@ -239,15 +205,15 @@ log_config = dict(
     interval=10,
     hooks=[
         'TextLoggerHook',
-        # 'WandbHook',
+        'WandbHook',
     ],
-    # wandb=dict(
-    #     init_kwargs=dict(
-    #         project='tree_canopy_detection',
-    #         name='tcd_exp1',
-    #     ),
-    #     num_eval_images=5,
-    # ),
+    wandb=dict(
+        init_kwargs=dict(
+            project='tree_canopy_detection',
+            name='tcd_exp1',
+        ),
+        num_eval_images=5,
+    ),
 )
 
 # Evaluation configuration
